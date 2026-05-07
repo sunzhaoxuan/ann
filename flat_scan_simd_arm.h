@@ -168,9 +168,46 @@ static inline float inner_product_neon32(const float* a, const float* b, size_t 
     return result;
 }
 
+// NEON + FMA + 4路累加器，一次循环处理 16 个 float
+static inline float inner_product_neon16_fma(const float* __restrict__ a, const float* __restrict__ b, size_t dim) {
+    size_t i = 0;
+
+    float32x4_t sum0 = vdupq_n_f32(0.0f);
+    float32x4_t sum1 = vdupq_n_f32(0.0f);
+    float32x4_t sum2 = vdupq_n_f32(0.0f);
+    float32x4_t sum3 = vdupq_n_f32(0.0f);
+
+    for (; i + 16 <= dim; i += 16) {
+        float32x4_t a0 = vld1q_f32(a + i);
+        float32x4_t b0 = vld1q_f32(b + i);
+
+        float32x4_t a1 = vld1q_f32(a + i + 4);
+        float32x4_t b1 = vld1q_f32(b + i + 4);
+
+        float32x4_t a2 = vld1q_f32(a + i + 8);
+        float32x4_t b2 = vld1q_f32(b + i + 8);
+
+        float32x4_t a3 = vld1q_f32(a + i + 12);
+        float32x4_t b3 = vld1q_f32(b + i + 12);
+
+        sum0 = vfmaq_f32(sum0, a0, b0);
+        sum1 = vfmaq_f32(sum1, a1, b1);
+        sum2 = vfmaq_f32(sum2, a2, b2);
+        sum3 = vfmaq_f32(sum3, a3, b3);
+    }
+
+    float32x4_t sum01 = vaddq_f32(sum0, sum1);
+    float32x4_t sum23 = vaddq_f32(sum2, sum3);
+    float32x4_t sum = vaddq_f32(sum01, sum23);
+
+    float result = vaddvq_f32(sum);
+
+    return result;
+}
+
 // IP distance:
 static inline float ip_distance_neon(const float* base_vec, const float* query, size_t vecdim) {
-    return 1.0f - inner_product_neon16(base_vec, query, vecdim);
+    return 1.0f - inner_product_neon16_fma(base_vec, query, vecdim);
 }
 
 std::priority_queue<std::pair<float, uint32_t> > flat_search_simd(
@@ -195,6 +232,70 @@ std::priority_queue<std::pair<float, uint32_t> > flat_search_simd(
                 q.pop();
             }
         }
+    }
+
+    return q;
+}
+
+
+std::priority_queue<std::pair<float, uint32_t> > flat_search_simd_fasttopk(
+    float* base,
+    float* query,
+    size_t base_number,
+    size_t vecdim,
+    size_t k
+) {
+    const size_t MAX_K = 10;  // 本实验 k=10
+    float best_score[MAX_K];
+    uint32_t best_id[MAX_K];
+
+    size_t cnt = 0;
+    size_t worst_pos = 0;
+    float worst_score = 0.0f;
+
+    auto recompute_worst = [&]() {
+        worst_pos = 0;
+        worst_score = best_score[0];
+
+        for (size_t j = 1; j < cnt; ++j) {
+            if (best_score[j] < worst_score) {
+                worst_score = best_score[j];
+                worst_pos = j;
+            }
+        }
+    };
+
+    for (size_t i = 0; i < base_number; ++i) {
+        ///*
+        if (i + 16 < base_number) {
+            __builtin_prefetch(base + (i + 16) * vecdim, 0, 1);
+        }
+        //*/
+        const float* base_vec = base + i * vecdim;
+
+        float score = inner_product_neon16_fma(base_vec, query, vecdim);
+
+        if (cnt < k) {
+            best_score[cnt] = score;
+            best_id[cnt] = static_cast<uint32_t>(i);
+            ++cnt;
+
+            if (cnt == k) {
+                recompute_worst();
+            }
+        } else {
+            if (score > worst_score) {
+                best_score[worst_pos] = score;
+                best_id[worst_pos] = static_cast<uint32_t>(i);
+                recompute_worst();
+            }
+        }
+    }
+
+    std::priority_queue<std::pair<float, uint32_t> > q;
+    for (size_t j = 0; j < cnt; ++j) {
+        float dis = 1.0f - best_score[j];
+        q.push({dis, best_id[j]});
     }
 
     return q;

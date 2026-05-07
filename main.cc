@@ -11,6 +11,8 @@
 #include <omp.h>
 #include "hnswlib/hnswlib/hnswlib.h"
 #include "flat_scan.h"
+#include "flat_scan_simd.h"
+#include "sq_scan_simd.h"
 // 可以自行添加需要的头文件
 
 using namespace hnswlib;
@@ -84,17 +86,31 @@ int main(int argc, char *argv[])
     // 不建议在正式测试查询时同时构建索引，否则性能波动会较大
     // 下面是一个构建hnsw索引的示例
     // build_index(base, base_number, vecdim);
-
+    SQIndexSIMD sq_index(base, base_number, vecdim);
     
     // 查询测试代码
     for(int i = 0; i < test_number; ++i) {
         const unsigned long Converter = 1000 * 1000;
+
+        const size_t rerank_p = 12;
+
         struct timeval val;
         int ret = gettimeofday(&val, NULL);
 
         // 该文件已有代码中你只能修改该函数的调用方式
         // 可以任意修改函数名，函数参数或者改为调用成员函数，但是不能修改函数返回值。
-        auto res = flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
+        //auto res = flat_search(base, test_query + i*vecdim, base_number, vecdim, k);
+
+        //auto res = flat_search_simd(base, test_query + i*vecdim, base_number, vecdim, k);
+
+        //flat_simd优化版本，作为后续基线
+        //auto res = flat_search_simd_fasttopk(base, test_query + i * vecdim, base_number, vecdim, k);
+
+        auto res = sq_index.search(
+            test_query + i * vecdim,
+            k,
+            rerank_p
+        );
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);
