@@ -8,23 +8,32 @@
 #include <algorithm>
 #include <limits>
 #include <iostream>
+#include <random>
 #include <arm_neon.h>
 
 #include "flat_scan_simd.h"
+
+// ============================================================
+// PQ 初始化方式
+// ============================================================
+
+enum class PQInitMode {
+    Uniform,   // 原始均匀抽样初始化
+    KMeansPP   // KMeans++ 初始化
+};
 
 // ============================================================
 // 基础 PQ-SIMD 版本
 //
 // 默认设置：
 //   vecdim = 96
-//   M      = 12
-//   subdim = 8
-//   Ks     = 64
+//   M      = 4, 8, 12, 16
+//   subdim = 24, 12, 8, 6
+//   Ks     = 256
 //
 // 离线阶段：
-//   1. 每个子空间用训练样本做简化 KMeans
-//   2. 得到 M 组 codebook
-//   3. 将每条 base 向量编码成 M 个 uint8_t code
+//   1. 每个子空间训练 codebook
+//   2. 将每条 base 向量编码成 M 个 uint8_t code
 //
 // 在线阶段：
 //   1. 对 query 构建 M × Ks 的 LUT
@@ -42,16 +51,17 @@ static inline float pq_inner_product_8_neon(
     const float* __restrict__ a,
     const float* __restrict__ b
 ) {
-    float32x4_t sum0 = vdupq_n_f32(0.0f);
-    float32x4_t va0 = vld1q_f32(a);
-    float32x4_t vb0 = vld1q_f32(b);
-    float32x4_t va1 = vld1q_f32(a + 4);
-    float32x4_t vb1 = vld1q_f32(b + 4);
+    float32x4_t sum = vdupq_n_f32(0.0f);
 
-    sum0 = vfmaq_f32(sum0, va0, vb0);
-    sum0 = vfmaq_f32(sum0, va1, vb1);
+    float32x4_t a0 = vld1q_f32(a);
+    float32x4_t b0 = vld1q_f32(b);
+    sum = vfmaq_f32(sum, a0, b0);
 
-    return pq_horizontal_sum_f32(sum0);
+    float32x4_t a1 = vld1q_f32(a + 4);
+    float32x4_t b1 = vld1q_f32(b + 4);
+    sum = vfmaq_f32(sum, a1, b1);
+
+    return pq_horizontal_sum_f32(sum);
 }
 
 // 计算 8 维子向量 L2 距离，用于 KMeans 分配和 PQ 编码
@@ -124,7 +134,7 @@ static inline float pq_inner_product_generic(
     return result;
 }
 
-// 重新寻找固定数组中当前最差项
+// 固定数组中重新寻找当前最差项
 static inline void pq_recompute_worst_score(
     const float* score,
     size_t cnt,
@@ -142,6 +152,249 @@ static inline void pq_recompute_worst_score(
     }
 }
 
+// 通用 PQ code 查表累加
+static inline float pq_scan_code_generic(
+    const uint8_t* __restrict__ code,
+    const float* __restrict__ lut,
+    size_t M,
+    size_t Ks
+) {
+    float score = 0.0f;
+
+    for (size_t m = 0; m < M; ++m) {
+        score += lut[m * Ks + static_cast<size_t>(code[m])];
+    }
+
+    return score;
+}
+
+// M = 4 特化版本
+static inline float pq_scan_code_m4(
+    const uint8_t* __restrict__ code,
+    const float* __restrict__ lut,
+    size_t Ks
+) {
+    return
+        lut[0 * Ks + static_cast<size_t>(code[0])] +
+        lut[1 * Ks + static_cast<size_t>(code[1])] +
+        lut[2 * Ks + static_cast<size_t>(code[2])] +
+        lut[3 * Ks + static_cast<size_t>(code[3])];
+}
+
+// M = 8 特化版本
+static inline float pq_scan_code_m8(
+    const uint8_t* __restrict__ code,
+    const float* __restrict__ lut,
+    size_t Ks
+) {
+    return
+        lut[0 * Ks + static_cast<size_t>(code[0])] +
+        lut[1 * Ks + static_cast<size_t>(code[1])] +
+        lut[2 * Ks + static_cast<size_t>(code[2])] +
+        lut[3 * Ks + static_cast<size_t>(code[3])] +
+        lut[4 * Ks + static_cast<size_t>(code[4])] +
+        lut[5 * Ks + static_cast<size_t>(code[5])] +
+        lut[6 * Ks + static_cast<size_t>(code[6])] +
+        lut[7 * Ks + static_cast<size_t>(code[7])];
+}
+
+// M = 12 特化版本
+static inline float pq_scan_code_m12(
+    const uint8_t* __restrict__ code,
+    const float* __restrict__ lut,
+    size_t Ks
+) {
+    return
+        lut[0  * Ks + static_cast<size_t>(code[0])]  +
+        lut[1  * Ks + static_cast<size_t>(code[1])]  +
+        lut[2  * Ks + static_cast<size_t>(code[2])]  +
+        lut[3  * Ks + static_cast<size_t>(code[3])]  +
+        lut[4  * Ks + static_cast<size_t>(code[4])]  +
+        lut[5  * Ks + static_cast<size_t>(code[5])]  +
+        lut[6  * Ks + static_cast<size_t>(code[6])]  +
+        lut[7  * Ks + static_cast<size_t>(code[7])]  +
+        lut[8  * Ks + static_cast<size_t>(code[8])]  +
+        lut[9  * Ks + static_cast<size_t>(code[9])]  +
+        lut[10 * Ks + static_cast<size_t>(code[10])] +
+        lut[11 * Ks + static_cast<size_t>(code[11])];
+}
+
+// M = 16 特化版本
+static inline float pq_scan_code_m16(
+    const uint8_t* __restrict__ code,
+    const float* __restrict__ lut,
+    size_t Ks
+) {
+    return
+        lut[0  * Ks + static_cast<size_t>(code[0])]  +
+        lut[1  * Ks + static_cast<size_t>(code[1])]  +
+        lut[2  * Ks + static_cast<size_t>(code[2])]  +
+        lut[3  * Ks + static_cast<size_t>(code[3])]  +
+        lut[4  * Ks + static_cast<size_t>(code[4])]  +
+        lut[5  * Ks + static_cast<size_t>(code[5])]  +
+        lut[6  * Ks + static_cast<size_t>(code[6])]  +
+        lut[7  * Ks + static_cast<size_t>(code[7])]  +
+        lut[8  * Ks + static_cast<size_t>(code[8])]  +
+        lut[9  * Ks + static_cast<size_t>(code[9])]  +
+        lut[10 * Ks + static_cast<size_t>(code[10])] +
+        lut[11 * Ks + static_cast<size_t>(code[11])] +
+        lut[12 * Ks + static_cast<size_t>(code[12])] +
+        lut[13 * Ks + static_cast<size_t>(code[13])] +
+        lut[14 * Ks + static_cast<size_t>(code[14])] +
+        lut[15 * Ks + static_cast<size_t>(code[15])];
+}
+
+// 统一入口：特殊 M 走展开版本，其他 M 走通用版本
+static inline float pq_scan_code(
+    const uint8_t* __restrict__ code,
+    const float* __restrict__ lut,
+    size_t M,
+    size_t Ks
+) {
+    switch (M) {
+        case 4:
+            return pq_scan_code_m4(code, lut, Ks);
+        case 8:
+            return pq_scan_code_m8(code, lut, Ks);
+        case 12:
+            return pq_scan_code_m12(code, lut, Ks);
+        case 16:
+            return pq_scan_code_m16(code, lut, Ks);
+        default:
+            return pq_scan_code_generic(code, lut, M, Ks);
+    }
+}
+
+// 固定数组 Top-p 更新函数
+static inline void pq_update_top_p(
+    float score,
+    uint32_t id,
+    float* cand_score,
+    uint32_t* cand_id,
+    size_t rerank_p,
+    size_t& cand_cnt,
+    size_t& cand_worst_pos,
+    float& cand_worst_score
+) {
+    if (cand_cnt < rerank_p) {
+        cand_score[cand_cnt] = score;
+        cand_id[cand_cnt] = id;
+        ++cand_cnt;
+
+        if (cand_cnt == rerank_p) {
+            pq_recompute_worst_score(
+                cand_score,
+                cand_cnt,
+                cand_worst_pos,
+                cand_worst_score
+            );
+        }
+    } else {
+        if (score > cand_worst_score) {
+            cand_score[cand_worst_pos] = score;
+            cand_id[cand_worst_pos] = id;
+
+            pq_recompute_worst_score(
+                cand_score,
+                cand_cnt,
+                cand_worst_pos,
+                cand_worst_score
+            );
+        }
+    }
+}
+
+static inline void pq_scan_code_batch4(
+    const uint8_t* __restrict__ codes_ptr,
+    const float* __restrict__ lut,
+    size_t M,
+    size_t Ks,
+    float& s0,
+    float& s1,
+    float& s2,
+    float& s3
+) {
+    const uint8_t* code0 = codes_ptr;
+    const uint8_t* code1 = codes_ptr + M;
+    const uint8_t* code2 = codes_ptr + 2 * M;
+    const uint8_t* code3 = codes_ptr + 3 * M;
+
+    s0 = pq_scan_code(code0, lut, M, Ks);
+    s1 = pq_scan_code(code1, lut, M, Ks);
+    s2 = pq_scan_code(code2, lut, M, Ks);
+    s3 = pq_scan_code(code3, lut, M, Ks);
+}
+
+static inline void pq_scan_code_batch4_interleaved(
+    const uint8_t* __restrict__ codes_ptr,
+    const float* __restrict__ lut,
+    size_t M,
+    size_t Ks,
+    float& s0,
+    float& s1,
+    float& s2,
+    float& s3
+) {
+    const uint8_t* code0 = codes_ptr;
+    const uint8_t* code1 = codes_ptr + M;
+    const uint8_t* code2 = codes_ptr + 2 * M;
+    const uint8_t* code3 = codes_ptr + 3 * M;
+
+    s0 = 0.0f;
+    s1 = 0.0f;
+    s2 = 0.0f;
+    s3 = 0.0f;
+
+    for (size_t m = 0; m < M; ++m) {
+        const float* lut_m = lut + m * Ks;
+
+        s0 += lut_m[static_cast<size_t>(code0[m])];
+        s1 += lut_m[static_cast<size_t>(code1[m])];
+        s2 += lut_m[static_cast<size_t>(code2[m])];
+        s3 += lut_m[static_cast<size_t>(code3[m])];
+    }
+}
+
+static inline void pq_scan_code_batch4_m12_interleaved(
+    const uint8_t* __restrict__ codes_ptr,
+    const float* __restrict__ lut,
+    size_t Ks,
+    float& s0,
+    float& s1,
+    float& s2,
+    float& s3
+) {
+    const uint8_t* code0 = codes_ptr;
+    const uint8_t* code1 = codes_ptr + 12;
+    const uint8_t* code2 = codes_ptr + 24;
+    const uint8_t* code3 = codes_ptr + 36;
+
+    s0 = s1 = s2 = s3 = 0.0f;
+
+    #define ADD_M(m) do { \
+        const float* lut_m = lut + (m) * Ks; \
+        s0 += lut_m[static_cast<size_t>(code0[m])]; \
+        s1 += lut_m[static_cast<size_t>(code1[m])]; \
+        s2 += lut_m[static_cast<size_t>(code2[m])]; \
+        s3 += lut_m[static_cast<size_t>(code3[m])]; \
+    } while (0)
+
+    ADD_M(0);
+    ADD_M(1);
+    ADD_M(2);
+    ADD_M(3);
+    ADD_M(4);
+    ADD_M(5);
+    ADD_M(6);
+    ADD_M(7);
+    ADD_M(8);
+    ADD_M(9);
+    ADD_M(10);
+    ADD_M(11);
+
+    #undef ADD_M
+}
+
 class PQIndexSIMD {
 public:
     PQIndexSIMD(
@@ -151,15 +404,18 @@ public:
         size_t M = 12,
         size_t Ks = 64,
         size_t train_size = 10000,
-        size_t kmeans_iters = 6
+        size_t kmeans_iters = 6,
+        PQInitMode init_mode = PQInitMode::Uniform
     )
         : base_float(base),
           base_number(base_number),
           vecdim(vecdim),
           M(M),
           Ks(Ks),
+          subdim(0),
           train_size(train_size),
-          kmeans_iters(kmeans_iters)
+          kmeans_iters(kmeans_iters),
+          init_mode(init_mode)
     {
         if (this->M == 0) {
             this->M = 12;
@@ -186,6 +442,15 @@ public:
 
         if (this->train_size > base_number) {
             this->train_size = base_number;
+        }
+
+        if (this->train_size < this->Ks) {
+            std::cerr << "PQ warning: train_size < Ks, reset train_size to Ks if possible\n";
+            if (base_number >= this->Ks) {
+                this->train_size = this->Ks;
+            } else {
+                this->train_size = base_number;
+            }
         }
 
         centroids.resize(this->M * this->Ks * subdim);
@@ -229,9 +494,10 @@ public:
 
         for (size_t m = 0; m < M; ++m) {
             const float* query_sub = query + m * subdim;
+            const float* centroid_base = &centroids[m * Ks * subdim];
 
             for (size_t c = 0; c < Ks; ++c) {
-                const float* centroid = get_centroid(m, c);
+                const float* centroid = centroid_base + c * subdim;
 
                 float score;
                 if (subdim == 8) {
@@ -254,6 +520,110 @@ public:
         size_t cand_worst_pos = 0;
         float cand_worst_score = 0.0f;
 
+        size_t i = 0;
+
+        ///*
+        // 一次处理 4 条 base code
+        for (; i + 4 <= base_number; i += 4) {
+            if (i + PREFETCH_DIST < base_number) {
+                __builtin_prefetch(&codes[(i + PREFETCH_DIST) * M], 0, 1);
+            }
+
+            const uint8_t* codes_ptr = &codes[i * M];
+
+            float s0, s1, s2, s3;
+
+            if (M == 12) {
+                pq_scan_code_batch4_m12_interleaved(
+                    codes_ptr,
+                    lut.data(),
+                    Ks,
+                    s0, s1, s2, s3
+                );
+            } else {
+                pq_scan_code_batch4_interleaved(
+                    codes_ptr,
+                    lut.data(),
+                    M,
+                    Ks,
+                    s0, s1, s2, s3
+                );
+            }
+
+            pq_update_top_p(
+                s0,
+                static_cast<uint32_t>(i + 0),
+                cand_score,
+                cand_id,
+                rerank_p,
+                cand_cnt,
+                cand_worst_pos,
+                cand_worst_score
+            );
+
+            pq_update_top_p(
+                s1,
+                static_cast<uint32_t>(i + 1),
+                cand_score,
+                cand_id,
+                rerank_p,
+                cand_cnt,
+                cand_worst_pos,
+                cand_worst_score
+            );
+
+            pq_update_top_p(
+                s2,
+                static_cast<uint32_t>(i + 2),
+                cand_score,
+                cand_id,
+                rerank_p,
+                cand_cnt,
+                cand_worst_pos,
+                cand_worst_score
+            );
+
+            pq_update_top_p(
+                s3,
+                static_cast<uint32_t>(i + 3),
+                cand_score,
+                cand_id,
+                rerank_p,
+                cand_cnt,
+                cand_worst_pos,
+                cand_worst_score
+            );
+        }
+
+        // 处理剩余不足 4 条的尾部
+        for (; i < base_number; ++i) {
+            if (i + PREFETCH_DIST < base_number) {
+                __builtin_prefetch(&codes[(i + PREFETCH_DIST) * M], 0, 1);
+            }
+
+            const uint8_t* code = &codes[i * M];
+
+            float approx_score = pq_scan_code(
+                code,
+                lut.data(),
+                M,
+                Ks
+            );
+
+            pq_update_top_p(
+                approx_score,
+                static_cast<uint32_t>(i),
+                cand_score,
+                cand_id,
+                rerank_p,
+                cand_cnt,
+                cand_worst_pos,
+                cand_worst_score
+            );
+        }
+        //*/
+
+        /*
         for (size_t i = 0; i < base_number; ++i) {
             if (i + PREFETCH_DIST < base_number) {
                 __builtin_prefetch(&codes[(i + PREFETCH_DIST) * M], 0, 1);
@@ -261,12 +631,7 @@ public:
 
             const uint8_t* code = &codes[i * M];
 
-            float approx_score = 0.0f;
-
-            for (size_t m = 0; m < M; ++m) {
-                uint8_t cid = code[m];
-                approx_score += lut[m * Ks + static_cast<size_t>(cid)];
-            }
+            float approx_score = pq_scan_code(code, lut.data(), M, Ks);
 
             if (cand_cnt < rerank_p) {
                 cand_score[cand_cnt] = approx_score;
@@ -295,7 +660,7 @@ public:
                 }
             }
         }
-
+        */
         // ----------------------------------------------------
         // 3. 精排：复用 Flat-SIMD 基线的原始 float 内积
         // ----------------------------------------------------
@@ -380,6 +745,10 @@ public:
         return subdim;
     }
 
+    PQInitMode get_init_mode() const {
+        return init_mode;
+    }
+
 private:
     float* base_float;
     size_t base_number;
@@ -391,6 +760,8 @@ private:
     size_t train_size;
     size_t kmeans_iters;
 
+    PQInitMode init_mode;
+
     std::vector<float> centroids;
     std::vector<uint8_t> codes;
 
@@ -399,7 +770,10 @@ private:
                   << ", Ks = " << Ks
                   << ", subdim = " << subdim
                   << ", train_size = " << train_size
-                  << ", iters = " << kmeans_iters << "\n";
+                  << ", iters = " << kmeans_iters
+                  << ", init = "
+                  << (init_mode == PQInitMode::KMeansPP ? "KMeans++" : "Uniform")
+                  << "\n";
 
         train_codebooks();
         encode_base();
@@ -419,7 +793,7 @@ private:
         return base_float + id * vecdim + m * subdim;
     }
 
-    // 确定训练样本 id：使用均匀抽样，避免引入随机数
+    // 确定训练样本 id：使用均匀抽样，避免训练集过大
     size_t train_id(size_t t) const {
         if (train_size <= 1) {
             return 0;
@@ -466,55 +840,144 @@ private:
         return static_cast<uint8_t>(best_c);
     }
 
+    // ========================================================
+    // 原始普通 KMeans 初始化：均匀抽样
+    // ========================================================
+    void init_centroids_uniform(size_t m) {
+        for (size_t c = 0; c < Ks; ++c) {
+            size_t t = c * train_size / Ks;
+
+            if (t >= train_size) {
+                t = train_size - 1;
+            }
+
+            size_t id = train_id(t);
+            const float* src = get_base_subvec(id, m);
+            float* dst = get_centroid(m, c);
+
+            for (size_t d = 0; d < subdim; ++d) {
+                dst[d] = src[d];
+            }
+        }
+    }
+
+    // ========================================================
+    // KMeans++ 初始化
+    //
+    // 第一个中心随机选择；
+    // 后续中心按样本到已有中心集合的最近距离进行加权采样。
+    // sub_l2 返回的是平方 L2 距离，因此可以直接作为权重。
+    // ========================================================
+    void init_centroids_kmeanspp(size_t m) {
+        std::mt19937 rng(2026 + static_cast<unsigned int>(m));
+
+        std::vector<float> min_dist(
+            train_size,
+            std::numeric_limits<float>::max()
+        );
+
+        // 1. 随机选择第一个中心
+        std::uniform_int_distribution<size_t> first_dist(0, train_size - 1);
+        size_t first_t = first_dist(rng);
+        size_t first_id = train_id(first_t);
+
+        {
+            const float* src = get_base_subvec(first_id, m);
+            float* dst = get_centroid(m, 0);
+
+            for (size_t d = 0; d < subdim; ++d) {
+                dst[d] = src[d];
+            }
+        }
+
+        // 2. 依次选择剩余 Ks-1 个中心
+        for (size_t c = 1; c < Ks; ++c) {
+            const float* last_centroid = get_centroid(m, c - 1);
+
+            float total_dist = 0.0f;
+
+            // 只需要用“新加入的中心”更新 min_dist
+            for (size_t t = 0; t < train_size; ++t) {
+                size_t id = train_id(t);
+                const float* subvec = get_base_subvec(id, m);
+
+                float dis = sub_l2(subvec, last_centroid);
+
+                if (dis < min_dist[t]) {
+                    min_dist[t] = dis;
+                }
+
+                total_dist += min_dist[t];
+            }
+
+            size_t chosen_t = 0;
+
+            if (total_dist <= 1e-12f) {
+                chosen_t = c % train_size;
+            } else {
+                std::uniform_real_distribution<float> prob_dist(0.0f, total_dist);
+                float r = prob_dist(rng);
+
+                float acc = 0.0f;
+                for (size_t t = 0; t < train_size; ++t) {
+                    acc += min_dist[t];
+
+                    if (acc >= r) {
+                        chosen_t = t;
+                        break;
+                    }
+                }
+            }
+
+            size_t chosen_id = train_id(chosen_t);
+            const float* src = get_base_subvec(chosen_id, m);
+            float* dst = get_centroid(m, c);
+
+            for (size_t d = 0; d < subdim; ++d) {
+                dst[d] = src[d];
+            }
+        }
+    }
+
+    // 统一初始化入口
+    void init_centroids(size_t m) {
+        if (init_mode == PQInitMode::KMeansPP) {
+            init_centroids_kmeanspp(m);
+        } else {
+            init_centroids_uniform(m);
+        }
+    }
+
     // --------------------------------------------------------
     // 训练每个子空间的 codebook
-    //
-    // 这是一个基础 KMeans：
-    //   1. 用均匀采样的训练点初始化 centroid
-    //   2. 分配训练样本到最近中心
-    //   3. 对每个中心求均值
-    //   4. 重复若干轮
     // --------------------------------------------------------
     void train_codebooks() {
-        std::vector<size_t> assign(train_size, 0);
         std::vector<float> sums(Ks * subdim);
         std::vector<size_t> counts(Ks);
 
         for (size_t m = 0; m < M; ++m) {
-            // 初始化 centroids
-            for (size_t c = 0; c < Ks; ++c) {
-                size_t t = c * train_size / Ks;
-                if (t >= train_size) {
-                    t = train_size - 1;
-                }
+            // 初始化 centroids：Uniform 或 KMeans++
+            init_centroids(m);
 
-                size_t id = train_id(t);
-                const float* src = get_base_subvec(id, m);
-                float* dst = get_centroid(m, c);
-
-                for (size_t d = 0; d < subdim; ++d) {
-                    dst[d] = src[d];
-                }
-            }
-
-            // KMeans 迭代
             for (size_t iter = 0; iter < kmeans_iters; ++iter) {
                 std::fill(sums.begin(), sums.end(), 0.0f);
                 std::fill(counts.begin(), counts.end(), 0);
 
+                // 分配训练样本到最近中心
                 for (size_t t = 0; t < train_size; ++t) {
                     size_t id = train_id(t);
                     const float* subvec = get_base_subvec(id, m);
 
-                    uint8_t cid = nearest_centroid_l2(subvec, m);
-                    assign[t] = static_cast<size_t>(cid);
+                    uint8_t cid_u8 = nearest_centroid_l2(subvec, m);
+                    size_t cid = static_cast<size_t>(cid_u8);
 
-                    float* sum_vec = &sums[static_cast<size_t>(cid) * subdim];
+                    float* sum_vec = &sums[cid * subdim];
+
                     for (size_t d = 0; d < subdim; ++d) {
                         sum_vec[d] += subvec[d];
                     }
 
-                    counts[static_cast<size_t>(cid)]++;
+                    counts[cid]++;
                 }
 
                 // 更新 centroids
@@ -540,7 +1003,14 @@ private:
                 }
             }
 
-            std::cerr << "PQ train subspace " << m + 1 << " / " << M << " done.\n";
+
+            /*
+            std::cerr << "PQ train subspace " << m + 1 << " / " << M
+                      << " with "
+                      << (init_mode == PQInitMode::KMeansPP ? "KMeans++" : "Uniform")
+                      << " init done.\n";
+            */
+            
         }
     }
 
