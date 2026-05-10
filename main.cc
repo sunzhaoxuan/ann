@@ -13,6 +13,8 @@
 #include "flat_scan.h"
 #include "flat_scan_simd.h"
 #include "sq_scan_simd.h"
+#include "sq_scan_simd_int8.h"
+#include "pq_scan_simd.h"
 // 可以自行添加需要的头文件
 
 using namespace hnswlib;
@@ -86,13 +88,26 @@ int main(int argc, char *argv[])
     // 不建议在正式测试查询时同时构建索引，否则性能波动会较大
     // 下面是一个构建hnsw索引的示例
     // build_index(base, base_number, vecdim);
-    SQIndexSIMD sq_index(base, base_number, vecdim);
-    
+    //SQIndexSIMD sq_index(base, base_number, vecdim);
+    //SQIndexSIMDInt8 sq_index(base, base_number, vecdim);
+    ///*
+    PQIndexSIMD pq_index(
+        base,
+        base_number,
+        vecdim,
+        16,      // M: 子空间数量 4,8,12,16 特殊优化(循环展开)
+        256,      // Ks: 每个子空间的聚类中心数量
+        20000,   // train_size: 训练样本数量
+        8,        // kmeans_iters: KMeans 迭代轮数
+        PQInitMode::KMeansPP  // init_mode: 初始化方式 KMeansPP or Uniform
+    );
+    //*/
+
     // 查询测试代码
     for(int i = 0; i < test_number; ++i) {
         const unsigned long Converter = 1000 * 1000;
 
-        const size_t rerank_p = 12;
+        const size_t rerank_p = 200;
 
         struct timeval val;
         int ret = gettimeofday(&val, NULL);
@@ -103,14 +118,14 @@ int main(int argc, char *argv[])
 
         //auto res = flat_search_simd(base, test_query + i*vecdim, base_number, vecdim, k);
 
-        //flat_simd优化版本，作为后续基线
+        //flat_simd优化版
         //auto res = flat_search_simd_fasttopk(base, test_query + i * vecdim, base_number, vecdim, k);
 
-        auto res = sq_index.search(
-            test_query + i * vecdim,
-            k,
-            rerank_p
-        );
+        //sq_simd
+        //auto res = sq_index.search(test_query + i * vecdim, k, rerank_p);
+
+        //pq_simd
+        auto res = pq_index.search(test_query + i * vecdim , k , rerank_p);
 
         struct timeval newVal;
         ret = gettimeofday(&newVal, NULL);

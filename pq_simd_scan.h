@@ -304,6 +304,63 @@ static inline void pq_update_top_p(
     }
 }
 
+// 固定数组中重新寻找 int32 分数数组的当前最差项
+static inline void pq_recompute_worst_score_i32(
+    const int32_t* score,
+    size_t cnt,
+    size_t& worst_pos,
+    int32_t& worst_score
+) {
+    worst_pos = 0;
+    worst_score = score[0];
+
+    for (size_t i = 1; i < cnt; ++i) {
+        if (score[i] < worst_score) {
+            worst_score = score[i];
+            worst_pos = i;
+        }
+    }
+}
+
+// int32 Top-p 更新函数
+static inline void pq_update_top_p_i32(
+    int32_t score,
+    uint32_t id,
+    int32_t* cand_score,
+    uint32_t* cand_id,
+    size_t rerank_p,
+    size_t& cand_cnt,
+    size_t& cand_worst_pos,
+    int32_t& cand_worst_score
+) {
+    if (cand_cnt < rerank_p) {
+        cand_score[cand_cnt] = score;
+        cand_id[cand_cnt] = id;
+        ++cand_cnt;
+
+        if (cand_cnt == rerank_p) {
+            pq_recompute_worst_score_i32(
+                cand_score,
+                cand_cnt,
+                cand_worst_pos,
+                cand_worst_score
+            );
+        }
+    } else {
+        if (score > cand_worst_score) {
+            cand_score[cand_worst_pos] = score;
+            cand_id[cand_worst_pos] = id;
+
+            pq_recompute_worst_score_i32(
+                cand_score,
+                cand_cnt,
+                cand_worst_pos,
+                cand_worst_score
+            );
+        }
+    }
+}
+
 static inline void pq_scan_code_batch4(
     const uint8_t* __restrict__ codes_ptr,
     const float* __restrict__ lut,
@@ -395,6 +452,231 @@ static inline void pq_scan_code_batch4_m12_interleaved(
     #undef ADD_M
 }
 
+// 将 float LUT 对称量化为 int16_t
+// 使用整个 LUT 的统一 scale，保证不同子空间的相对权重不被破坏
+static inline float pq_quantize_lut_i16(
+    const float* __restrict__ lut,
+    int16_t* __restrict__ lut_q,
+    size_t len
+) {
+    float max_abs = 0.0f;
+
+    for (size_t i = 0; i < len; ++i) {
+        float v = std::fabs(lut[i]);
+        if (v > max_abs) {
+            max_abs = v;
+        }
+    }
+
+    if (max_abs <= 1e-12f) {
+        for (size_t i = 0; i < len; ++i) {
+            lut_q[i] = 0;
+        }
+        return 1.0f;
+    }
+
+    float scale = 32767.0f / max_abs;
+
+    for (size_t i = 0; i < len; ++i) {
+        int q = static_cast<int>(std::round(lut[i] * scale));
+
+        if (q > 32767) {
+            q = 32767;
+        } else if (q < -32767) {
+            q = -32767;
+        }
+
+        lut_q[i] = static_cast<int16_t>(q);
+    }
+
+    return scale;
+}
+
+// 通用 int16 LUT 查表累加
+static inline int32_t pq_scan_code_i16_generic(
+    const uint8_t* __restrict__ code,
+    const int16_t* __restrict__ lut_q,
+    size_t M,
+    size_t Ks
+) {
+    int32_t score = 0;
+
+    for (size_t m = 0; m < M; ++m) {
+        score += static_cast<int32_t>(
+            lut_q[m * Ks + static_cast<size_t>(code[m])]
+        );
+    }
+
+    return score;
+}
+
+// M = 4
+static inline int32_t pq_scan_code_i16_m4(
+    const uint8_t* __restrict__ code,
+    const int16_t* __restrict__ lut_q,
+    size_t Ks
+) {
+    return
+        static_cast<int32_t>(lut_q[0 * Ks + static_cast<size_t>(code[0])]) +
+        static_cast<int32_t>(lut_q[1 * Ks + static_cast<size_t>(code[1])]) +
+        static_cast<int32_t>(lut_q[2 * Ks + static_cast<size_t>(code[2])]) +
+        static_cast<int32_t>(lut_q[3 * Ks + static_cast<size_t>(code[3])]);
+}
+
+// M = 8
+static inline int32_t pq_scan_code_i16_m8(
+    const uint8_t* __restrict__ code,
+    const int16_t* __restrict__ lut_q,
+    size_t Ks
+) {
+    return
+        static_cast<int32_t>(lut_q[0 * Ks + static_cast<size_t>(code[0])]) +
+        static_cast<int32_t>(lut_q[1 * Ks + static_cast<size_t>(code[1])]) +
+        static_cast<int32_t>(lut_q[2 * Ks + static_cast<size_t>(code[2])]) +
+        static_cast<int32_t>(lut_q[3 * Ks + static_cast<size_t>(code[3])]) +
+        static_cast<int32_t>(lut_q[4 * Ks + static_cast<size_t>(code[4])]) +
+        static_cast<int32_t>(lut_q[5 * Ks + static_cast<size_t>(code[5])]) +
+        static_cast<int32_t>(lut_q[6 * Ks + static_cast<size_t>(code[6])]) +
+        static_cast<int32_t>(lut_q[7 * Ks + static_cast<size_t>(code[7])]);
+}
+
+// M = 12
+static inline int32_t pq_scan_code_i16_m12(
+    const uint8_t* __restrict__ code,
+    const int16_t* __restrict__ lut_q,
+    size_t Ks
+) {
+    return
+        static_cast<int32_t>(lut_q[0  * Ks + static_cast<size_t>(code[0])])  +
+        static_cast<int32_t>(lut_q[1  * Ks + static_cast<size_t>(code[1])])  +
+        static_cast<int32_t>(lut_q[2  * Ks + static_cast<size_t>(code[2])])  +
+        static_cast<int32_t>(lut_q[3  * Ks + static_cast<size_t>(code[3])])  +
+        static_cast<int32_t>(lut_q[4  * Ks + static_cast<size_t>(code[4])])  +
+        static_cast<int32_t>(lut_q[5  * Ks + static_cast<size_t>(code[5])])  +
+        static_cast<int32_t>(lut_q[6  * Ks + static_cast<size_t>(code[6])])  +
+        static_cast<int32_t>(lut_q[7  * Ks + static_cast<size_t>(code[7])])  +
+        static_cast<int32_t>(lut_q[8  * Ks + static_cast<size_t>(code[8])])  +
+        static_cast<int32_t>(lut_q[9  * Ks + static_cast<size_t>(code[9])])  +
+        static_cast<int32_t>(lut_q[10 * Ks + static_cast<size_t>(code[10])]) +
+        static_cast<int32_t>(lut_q[11 * Ks + static_cast<size_t>(code[11])]);
+}
+
+// M = 16
+static inline int32_t pq_scan_code_i16_m16(
+    const uint8_t* __restrict__ code,
+    const int16_t* __restrict__ lut_q,
+    size_t Ks
+) {
+    return
+        static_cast<int32_t>(lut_q[0  * Ks + static_cast<size_t>(code[0])])  +
+        static_cast<int32_t>(lut_q[1  * Ks + static_cast<size_t>(code[1])])  +
+        static_cast<int32_t>(lut_q[2  * Ks + static_cast<size_t>(code[2])])  +
+        static_cast<int32_t>(lut_q[3  * Ks + static_cast<size_t>(code[3])])  +
+        static_cast<int32_t>(lut_q[4  * Ks + static_cast<size_t>(code[4])])  +
+        static_cast<int32_t>(lut_q[5  * Ks + static_cast<size_t>(code[5])])  +
+        static_cast<int32_t>(lut_q[6  * Ks + static_cast<size_t>(code[6])])  +
+        static_cast<int32_t>(lut_q[7  * Ks + static_cast<size_t>(code[7])])  +
+        static_cast<int32_t>(lut_q[8  * Ks + static_cast<size_t>(code[8])])  +
+        static_cast<int32_t>(lut_q[9  * Ks + static_cast<size_t>(code[9])])  +
+        static_cast<int32_t>(lut_q[10 * Ks + static_cast<size_t>(code[10])]) +
+        static_cast<int32_t>(lut_q[11 * Ks + static_cast<size_t>(code[11])]) +
+        static_cast<int32_t>(lut_q[12 * Ks + static_cast<size_t>(code[12])]) +
+        static_cast<int32_t>(lut_q[13 * Ks + static_cast<size_t>(code[13])]) +
+        static_cast<int32_t>(lut_q[14 * Ks + static_cast<size_t>(code[14])]) +
+        static_cast<int32_t>(lut_q[15 * Ks + static_cast<size_t>(code[15])]);
+}
+
+// 统一入口
+static inline int32_t pq_scan_code_i16(
+    const uint8_t* __restrict__ code,
+    const int16_t* __restrict__ lut_q,
+    size_t M,
+    size_t Ks
+) {
+    switch (M) {
+        case 4:
+            return pq_scan_code_i16_m4(code, lut_q, Ks);
+        case 8:
+            return pq_scan_code_i16_m8(code, lut_q, Ks);
+        case 12:
+            return pq_scan_code_i16_m12(code, lut_q, Ks);
+        case 16:
+            return pq_scan_code_i16_m16(code, lut_q, Ks);
+        default:
+            return pq_scan_code_i16_generic(code, lut_q, M, Ks);
+    }
+}
+
+static inline void pq_scan_code_i16_batch4_interleaved(
+    const uint8_t* __restrict__ codes_ptr,
+    const int16_t* __restrict__ lut_q,
+    size_t M,
+    size_t Ks,
+    int32_t& s0,
+    int32_t& s1,
+    int32_t& s2,
+    int32_t& s3
+) {
+    const uint8_t* code0 = codes_ptr;
+    const uint8_t* code1 = codes_ptr + M;
+    const uint8_t* code2 = codes_ptr + 2 * M;
+    const uint8_t* code3 = codes_ptr + 3 * M;
+
+    s0 = 0;
+    s1 = 0;
+    s2 = 0;
+    s3 = 0;
+
+    for (size_t m = 0; m < M; ++m) {
+        const int16_t* lut_m = lut_q + m * Ks;
+
+        s0 += static_cast<int32_t>(lut_m[static_cast<size_t>(code0[m])]);
+        s1 += static_cast<int32_t>(lut_m[static_cast<size_t>(code1[m])]);
+        s2 += static_cast<int32_t>(lut_m[static_cast<size_t>(code2[m])]);
+        s3 += static_cast<int32_t>(lut_m[static_cast<size_t>(code3[m])]);
+    }
+}
+
+static inline void pq_scan_code_i16_batch4_m12_interleaved(
+    const uint8_t* __restrict__ codes_ptr,
+    const int16_t* __restrict__ lut_q,
+    size_t Ks,
+    int32_t& s0,
+    int32_t& s1,
+    int32_t& s2,
+    int32_t& s3
+) {
+    const uint8_t* code0 = codes_ptr;
+    const uint8_t* code1 = codes_ptr + 12;
+    const uint8_t* code2 = codes_ptr + 24;
+    const uint8_t* code3 = codes_ptr + 36;
+
+    s0 = s1 = s2 = s3 = 0;
+
+    #define ADD_M_I16(m) do { \
+        const int16_t* lut_m = lut_q + (m) * Ks; \
+        s0 += static_cast<int32_t>(lut_m[static_cast<size_t>(code0[m])]); \
+        s1 += static_cast<int32_t>(lut_m[static_cast<size_t>(code1[m])]); \
+        s2 += static_cast<int32_t>(lut_m[static_cast<size_t>(code2[m])]); \
+        s3 += static_cast<int32_t>(lut_m[static_cast<size_t>(code3[m])]); \
+    } while (0)
+
+    ADD_M_I16(0);
+    ADD_M_I16(1);
+    ADD_M_I16(2);
+    ADD_M_I16(3);
+    ADD_M_I16(4);
+    ADD_M_I16(5);
+    ADD_M_I16(6);
+    ADD_M_I16(7);
+    ADD_M_I16(8);
+    ADD_M_I16(9);
+    ADD_M_I16(10);
+    ADD_M_I16(11);
+
+    #undef ADD_M_I16
+}
+
 class PQIndexSIMD {
 public:
     PQIndexSIMD(
@@ -415,7 +697,8 @@ public:
           subdim(0),
           train_size(train_size),
           kmeans_iters(kmeans_iters),
-          init_mode(init_mode)
+          init_mode(init_mode),
+          centroid_blocks(0)
     {
         if (this->M == 0) {
             this->M = 12;
@@ -487,42 +770,43 @@ public:
         // ----------------------------------------------------
         // 1. 构建 Query LUT
         //
-        // LUT[m][c] = query 的第 m 个子向量 与
-        //             第 m 个 codebook 中第 c 个中心的内积
+        // 使用跨 centroid SIMD：
+        // 一次计算 query 子向量与 4 个 centroid 的内积
         // ----------------------------------------------------
         std::vector<float> lut(M * Ks);
 
-        for (size_t m = 0; m < M; ++m) {
-            const float* query_sub = query + m * subdim;
-            const float* centroid_base = &centroids[m * Ks * subdim];
-
-            for (size_t c = 0; c < Ks; ++c) {
-                const float* centroid = centroid_base + c * subdim;
-
-                float score;
-                if (subdim == 8) {
-                    score = pq_inner_product_8_neon(query_sub, centroid);
-                } else {
-                    score = pq_inner_product_generic(query_sub, centroid, subdim);
-                }
-
-                lut[m * Ks + c] = score;
-            }
-        }
+        build_lut_xc4(
+            query,
+            lut.data()
+        );
 
         // ----------------------------------------------------
-        // 2. PQ 粗排：查表累加，维护 Top-p
+        // 2. 将 float LUT 量化为 int16 LUT
+        //
+        // 后续粗排阶段使用 int16 查表 + int32 累加
         // ----------------------------------------------------
-        float cand_score[MAX_P];
+        std::vector<int16_t> lut_q(M * Ks);
+
+        float lut_scale = pq_quantize_lut_i16(
+            lut.data(),
+            lut_q.data(),
+            M * Ks
+        );
+
+        (void)lut_scale;
+
+        // ----------------------------------------------------
+        // 3. PQ 粗排：int16 LUT 查表累加，维护 Top-p
+        // ----------------------------------------------------
+        int32_t cand_score[MAX_P];
         uint32_t cand_id[MAX_P];
 
         size_t cand_cnt = 0;
         size_t cand_worst_pos = 0;
-        float cand_worst_score = 0.0f;
+        int32_t cand_worst_score = 0;
 
         size_t i = 0;
 
-        ///*
         // 一次处理 4 条 base code
         for (; i + 4 <= base_number; i += 4) {
             if (i + PREFETCH_DIST < base_number) {
@@ -531,26 +815,26 @@ public:
 
             const uint8_t* codes_ptr = &codes[i * M];
 
-            float s0, s1, s2, s3;
+            int32_t s0, s1, s2, s3;
 
             if (M == 12) {
-                pq_scan_code_batch4_m12_interleaved(
+                pq_scan_code_i16_batch4_m12_interleaved(
                     codes_ptr,
-                    lut.data(),
+                    lut_q.data(),
                     Ks,
                     s0, s1, s2, s3
                 );
             } else {
-                pq_scan_code_batch4_interleaved(
+                pq_scan_code_i16_batch4_interleaved(
                     codes_ptr,
-                    lut.data(),
+                    lut_q.data(),
                     M,
                     Ks,
                     s0, s1, s2, s3
                 );
             }
 
-            pq_update_top_p(
+            pq_update_top_p_i32(
                 s0,
                 static_cast<uint32_t>(i + 0),
                 cand_score,
@@ -561,7 +845,7 @@ public:
                 cand_worst_score
             );
 
-            pq_update_top_p(
+            pq_update_top_p_i32(
                 s1,
                 static_cast<uint32_t>(i + 1),
                 cand_score,
@@ -572,7 +856,7 @@ public:
                 cand_worst_score
             );
 
-            pq_update_top_p(
+            pq_update_top_p_i32(
                 s2,
                 static_cast<uint32_t>(i + 2),
                 cand_score,
@@ -583,7 +867,7 @@ public:
                 cand_worst_score
             );
 
-            pq_update_top_p(
+            pq_update_top_p_i32(
                 s3,
                 static_cast<uint32_t>(i + 3),
                 cand_score,
@@ -595,7 +879,7 @@ public:
             );
         }
 
-        // 处理剩余不足 4 条的尾部
+        // 处理不足 4 条的尾部
         for (; i < base_number; ++i) {
             if (i + PREFETCH_DIST < base_number) {
                 __builtin_prefetch(&codes[(i + PREFETCH_DIST) * M], 0, 1);
@@ -603,14 +887,14 @@ public:
 
             const uint8_t* code = &codes[i * M];
 
-            float approx_score = pq_scan_code(
+            int32_t approx_score = pq_scan_code_i16(
                 code,
-                lut.data(),
+                lut_q.data(),
                 M,
                 Ks
             );
 
-            pq_update_top_p(
+            pq_update_top_p_i32(
                 approx_score,
                 static_cast<uint32_t>(i),
                 cand_score,
@@ -621,48 +905,9 @@ public:
                 cand_worst_score
             );
         }
-        //*/
 
-        /*
-        for (size_t i = 0; i < base_number; ++i) {
-            if (i + PREFETCH_DIST < base_number) {
-                __builtin_prefetch(&codes[(i + PREFETCH_DIST) * M], 0, 1);
-            }
-
-            const uint8_t* code = &codes[i * M];
-
-            float approx_score = pq_scan_code(code, lut.data(), M, Ks);
-
-            if (cand_cnt < rerank_p) {
-                cand_score[cand_cnt] = approx_score;
-                cand_id[cand_cnt] = static_cast<uint32_t>(i);
-                ++cand_cnt;
-
-                if (cand_cnt == rerank_p) {
-                    pq_recompute_worst_score(
-                        cand_score,
-                        cand_cnt,
-                        cand_worst_pos,
-                        cand_worst_score
-                    );
-                }
-            } else {
-                if (approx_score > cand_worst_score) {
-                    cand_score[cand_worst_pos] = approx_score;
-                    cand_id[cand_worst_pos] = static_cast<uint32_t>(i);
-
-                    pq_recompute_worst_score(
-                        cand_score,
-                        cand_cnt,
-                        cand_worst_pos,
-                        cand_worst_score
-                    );
-                }
-            }
-        }
-        */
         // ----------------------------------------------------
-        // 3. 精排：复用 Flat-SIMD 基线的原始 float 内积
+        // 4. 精排：对 Top-p 候选使用原始 float + NEON-FMA
         // ----------------------------------------------------
         float best_score[MAX_K];
         uint32_t best_id[MAX_K];
@@ -676,6 +921,7 @@ public:
 
             if (i + 4 < cand_cnt) {
                 uint32_t next_id = cand_id[i + 4];
+
                 __builtin_prefetch(
                     base_float + static_cast<size_t>(next_id) * vecdim,
                     0,
@@ -721,7 +967,7 @@ public:
         }
 
         // ----------------------------------------------------
-        // 4. 返回 main.cc 原有格式：priority_queue<pair<dis,id>>
+        // 5. 返回 main.cc 原有格式：priority_queue<pair<dis,id>>
         // ----------------------------------------------------
         std::priority_queue<std::pair<float, uint32_t> > q;
 
@@ -765,6 +1011,13 @@ private:
     std::vector<float> centroids;
     std::vector<uint8_t> codes;
 
+    // 跨 centroid SIMD 使用的转置 centroid 布局
+    // 布局: centroids_xc4[m][centroid_block][dim][lane]
+    // lane = 0,1,2,3 表示同一个 block 中的 4 个 centroid
+    std::vector<float> centroids_xc4;
+    size_t centroid_blocks;
+
+
     void build() {
         std::cerr << "PQ build start. M = " << M
                   << ", Ks = " << Ks
@@ -776,6 +1029,10 @@ private:
                   << "\n";
 
         train_codebooks();
+
+        // 为在线 LUT 构建准备跨 centroid SIMD 布局
+        build_centroids_xc4();
+
         encode_base();
 
         std::cerr << "PQ build done.\n";
@@ -1035,6 +1292,117 @@ private:
             for (size_t m = 0; m < M; ++m) {
                 const float* subvec = get_base_subvec(i, m);
                 code[m] = nearest_centroid_l2(subvec, m);
+            }
+        }
+    }
+
+    void build_centroids_xc4() {
+        centroid_blocks = (Ks + 3) / 4;
+
+        centroids_xc4.assign(
+            M * centroid_blocks * subdim * 4,
+            0.0f
+        );
+
+        for (size_t m = 0; m < M; ++m) {
+            for (size_t cb = 0; cb < centroid_blocks; ++cb) {
+                for (size_t d = 0; d < subdim; ++d) {
+                    for (size_t lane = 0; lane < 4; ++lane) {
+                        size_t c = cb * 4 + lane;
+
+                        float value = 0.0f;
+
+                        if (c < Ks) {
+                            value = centroids[(m * Ks + c) * subdim + d];
+                        }
+
+                        centroids_xc4[
+                            ((m * centroid_blocks + cb) * subdim + d) * 4 + lane
+                        ] = value;
+                    }
+                }
+            }
+        }
+    }
+
+    void build_lut_xc4(
+        const float* __restrict__ query,
+        float* __restrict__ lut
+    ) const {
+        constexpr size_t MAX_SUBDIM = 64;
+        float32x4_t qv_cache[MAX_SUBDIM];
+
+        for (size_t m = 0; m < M; ++m) {
+            const float* query_sub = query + m * subdim;
+            float* lut_m = lut + m * Ks;
+
+            if (subdim <= MAX_SUBDIM) {
+                for (size_t d = 0; d < subdim; ++d) {
+                    qv_cache[d] = vdupq_n_f32(query_sub[d]);
+                }
+
+                for (size_t cb = 0; cb < centroid_blocks; ++cb) {
+                    float32x4_t sum = vdupq_n_f32(0.0f);
+
+                    for (size_t d = 0; d < subdim; ++d) {
+                        const float* cent4 =
+                            &centroids_xc4[
+                                ((m * centroid_blocks + cb) * subdim + d) * 4
+                            ];
+
+                        float32x4_t cv = vld1q_f32(cent4);
+                        sum = vfmaq_f32(sum, qv_cache[d], cv);
+                    }
+
+                    size_t c0 = cb * 4;
+
+                    if (c0 + 3 < Ks) {
+                        vst1q_f32(lut_m + c0, sum);
+                    } else {
+                        float temp[4];
+                        vst1q_f32(temp, sum);
+
+                        for (size_t lane = 0; lane < 4; ++lane) {
+                            size_t c = c0 + lane;
+                            if (c < Ks) {
+                                lut_m[c] = temp[lane];
+                            }
+                        }
+                    }
+                }
+            } else {
+                // 极端情况下的备用路径，一般不会进入
+                for (size_t cb = 0; cb < centroid_blocks; ++cb) {
+                    float32x4_t sum = vdupq_n_f32(0.0f);
+
+                    for (size_t d = 0; d < subdim; ++d) {
+                        float32x4_t qv = vdupq_n_f32(query_sub[d]);
+
+                        const float* cent4 =
+                            &centroids_xc4[
+                                ((m * centroid_blocks + cb) * subdim + d) * 4
+                            ];
+
+                        float32x4_t cv = vld1q_f32(cent4);
+                        sum = vfmaq_f32(sum, qv, cv);
+                    }
+
+                    size_t c0 = cb * 4;
+
+                    if (c0 + 3 < Ks) {
+                        vst1q_f32(lut_m + c0, sum);
+                    } else {
+                        float temp[4];
+                        vst1q_f32(temp, sum);
+
+                        for (size_t lane = 0; lane < 4; ++lane) {
+                            size_t c = c0 + lane;
+                            if (c < Ks) {
+                                lut_m[c] = temp[lane];
+                            }
+                        }
+                    }
+                }
             }
         }
     }
