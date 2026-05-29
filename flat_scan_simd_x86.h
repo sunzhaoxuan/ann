@@ -42,13 +42,6 @@ static inline float inner_product_simd(const float* a, const float* b, size_t di
     result += temp[0] + temp[1] + temp[2] + temp[3];
 
 #endif
-
-    // 处理剩余维度，防止 dim 不是 4 或 8 的倍数
-    for (; i < dim; ++i) {
-        result += a[i] * b[i];
-    }
-
-    return result;
 }
 
 // dis = 1 - inner_product
