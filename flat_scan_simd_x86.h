@@ -42,6 +42,12 @@ static inline float inner_product_simd(const float* a, const float* b, size_t di
     result += temp[0] + temp[1] + temp[2] + temp[3];
 
 #endif
+
+    for (; i < dim; ++i) {
+        result += a[i] * b[i];
+    }
+
+    return result;
 }
 
 // dis = 1 - inner_product

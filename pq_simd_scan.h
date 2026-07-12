@@ -9,9 +9,10 @@
 #include <limits>
 #include <iostream>
 #include <random>
-#include <arm_neon.h>
+#include "simd_compat.h"
 #include <chrono>
 #include <omp.h>
+#include <pthread.h>
 
 #include "flat_scan_simd.h"
 

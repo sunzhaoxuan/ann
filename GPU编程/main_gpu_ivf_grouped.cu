@@ -507,8 +507,11 @@ std::vector<size_t> build_top2_grouped_order(
     return query_order;
 }
 
-int main() {
-    std::string data_path = "./data/";
+int main(int argc, char** argv) {
+    std::string data_path = argc > 1 ? argv[1] : "./data/";
+    if (!data_path.empty() && data_path.back() != '/' && data_path.back() != '\\') {
+        data_path.push_back('/');
+    }
 
     size_t test_number = 0;
     size_t base_number = 0;

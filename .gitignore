@@ -1,0 +1,7 @@
+/bin/
+/data/smoke/
+/results/
+/*.exe
+/workflow_mpi
+/output/
+*.csv

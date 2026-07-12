@@ -1,6 +1,7 @@
 #pragma once
 
-#include <arm_neon.h>
+#include "simd_compat.h"
+#include "opq_transform.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -37,6 +38,45 @@
 enum class IVFPQLocalInitMode {
     Uniform
 };
+
+enum class IVFPQMPISplitMode {
+    Block,
+    Cyclic
+};
+
+struct IVFPQLocalMPIProfile {
+    size_t owned_probe_lists = 0;
+    size_t scanned_codes = 0;
+    size_t returned_candidates = 0;
+};
+
+static inline bool ivfpq_mpi_owns_list(
+    size_t list_id,
+    size_t nlist,
+    int rank,
+    int world_size,
+    IVFPQMPISplitMode mode
+) {
+    if (world_size <= 1) {
+        return true;
+    }
+
+    if (rank < 0 || rank >= world_size) {
+        return false;
+    }
+
+    if (mode == IVFPQMPISplitMode::Cyclic) {
+        return static_cast<int>(list_id % static_cast<size_t>(world_size)) == rank;
+    }
+
+    const size_t processes = static_cast<size_t>(world_size);
+    const size_t base = nlist / processes;
+    const size_t remainder = nlist % processes;
+    const size_t rank_size = static_cast<size_t>(rank);
+    const size_t begin = rank_size * base + std::min(rank_size, remainder);
+    const size_t length = base + (rank_size < remainder ? 1 : 0);
+    return list_id >= begin && list_id < begin + length;
+}
 
 // ------------------------------------------------------------
 // SIMD L2 距离
@@ -261,7 +301,8 @@ public:
         size_t Ks = 256,
         size_t train_size = 10000,
         size_t kmeans_iters = 6,
-        IVFPQLocalInitMode init_mode = IVFPQLocalInitMode::Uniform
+        IVFPQLocalInitMode init_mode = IVFPQLocalInitMode::Uniform,
+        size_t opq_iters = 0
     )
         : base_float(base),
           base_number(base_number),
@@ -271,7 +312,8 @@ public:
           Ks(Ks),
           train_size(train_size),
           kmeans_iters(kmeans_iters),
-          init_mode(init_mode)
+          init_mode(init_mode),
+          opq_iters(opq_iters)
     {
         normalize_params();
 
@@ -313,6 +355,9 @@ public:
             return result;
         }
 
+        std::vector<float> rotated_query;
+        const float* pq_query = prepare_pq_query(query, rotated_query);
+
         // 2. 在选中 lists 内扫描局部 PQ code，维护 Top-rerank_p
         std::vector<float> cand_score(rerank_p);
         std::vector<uint32_t> cand_id(rerank_p);
@@ -334,7 +379,7 @@ public:
             // 注意：每个 list 有自己的 PQ codebook，
             // 因此每访问一个 list 都需要重新构建一次 LUT
             build_local_pq_lut(
-                query,
+                pq_query,
                 list,
                 lut.data()
             );
@@ -416,6 +461,306 @@ public:
         return result;
     }
 
+    // Release list-local PQ data that belongs to other MPI ranks. Coarse
+    // centroids are intentionally retained because every rank performs the
+    // same routing step for a query.
+    void keep_only_mpi_local_lists(
+        int rank,
+        int world_size,
+        IVFPQMPISplitMode split_mode
+    ) {
+        for (size_t cid = 0; cid < lists.size(); ++cid) {
+            if (ivfpq_mpi_owns_list(cid, nlist, rank, world_size, split_mode)) {
+                continue;
+            }
+
+            std::vector<uint32_t>().swap(lists[cid].ids);
+            std::vector<float>().swap(lists[cid].codebooks);
+            std::vector<uint8_t>().swap(lists[cid].codes);
+        }
+    }
+
+    std::priority_queue<std::pair<float, uint32_t> > search_mpi_local(
+        float* query,
+        size_t k,
+        size_t nprobe,
+        size_t rerank_p,
+        size_t local_p,
+        int rank,
+        int world_size,
+        IVFPQMPISplitMode split_mode,
+        IVFPQLocalMPIProfile* profile = nullptr
+    ) const {
+        std::priority_queue<std::pair<float, uint32_t> > result;
+
+        if (profile != nullptr) {
+            *profile = IVFPQLocalMPIProfile();
+        }
+
+        if (k == 0 || base_number == 0 || nlist == 0 || world_size <= 0) {
+            return result;
+        }
+
+        k = std::min(k, base_number);
+        nprobe = std::max<size_t>(1, std::min(nprobe, nlist));
+        rerank_p = std::max(k, std::min(rerank_p, base_number));
+        local_p = std::max(k, std::min(local_p, base_number));
+
+        std::vector<uint32_t> probe_ids;
+        select_probe_ids(query, nprobe, probe_ids);
+
+        std::vector<float> rotated_query;
+        const float* pq_query = prepare_pq_query(query, rotated_query);
+
+        std::vector<float> candidate_scores(rerank_p);
+        std::vector<uint32_t> candidate_ids(rerank_p);
+        size_t candidate_count = 0;
+        size_t candidate_worst_position = 0;
+        float candidate_worst_score = 0.0f;
+        std::vector<float> lut(M * Ks);
+
+        for (uint32_t cid : probe_ids) {
+            if (!ivfpq_mpi_owns_list(cid, nlist, rank, world_size, split_mode)) {
+                continue;
+            }
+
+            const LocalPQList& list = lists[cid];
+            if (list.ids.empty()) {
+                continue;
+            }
+
+            if (profile != nullptr) {
+                ++profile->owned_probe_lists;
+                profile->scanned_codes += list.ids.size();
+            }
+
+            build_local_pq_lut(pq_query, list, lut.data());
+
+            for (size_t j = 0; j < list.ids.size(); ++j) {
+                const float score = scan_local_pq_code(
+                    list.codes.data() + j * M,
+                    lut.data()
+                );
+
+                ivfpqlocal_update_top_score(
+                    score,
+                    list.ids[j],
+                    candidate_scores.data(),
+                    candidate_ids.data(),
+                    rerank_p,
+                    candidate_count,
+                    candidate_worst_position,
+                    candidate_worst_score
+                );
+            }
+        }
+
+        std::vector<float> best_scores(local_p);
+        std::vector<uint32_t> best_ids(local_p);
+        size_t best_count = 0;
+        size_t best_worst_position = 0;
+        float best_worst_score = 0.0f;
+
+        for (size_t i = 0; i < candidate_count; ++i) {
+            const uint32_t id = candidate_ids[i];
+            const float score = ivfpqlocal_inner_product_neon_fma(
+                base_float + static_cast<size_t>(id) * vecdim,
+                query,
+                vecdim
+            );
+
+            ivfpqlocal_update_top_score(
+                score,
+                id,
+                best_scores.data(),
+                best_ids.data(),
+                local_p,
+                best_count,
+                best_worst_position,
+                best_worst_score
+            );
+        }
+
+        for (size_t i = 0; i < best_count; ++i) {
+            result.push({1.0f - best_scores[i], best_ids[i]});
+        }
+
+        if (profile != nullptr) {
+            profile->returned_candidates = best_count;
+        }
+
+        return result;
+    }
+
+    std::priority_queue<std::pair<float, uint32_t> >
+    search_mpi_local_omp_list_parallel(
+        float* query,
+        size_t k,
+        size_t nprobe,
+        size_t rerank_p,
+        size_t local_p,
+        int rank,
+        int world_size,
+        IVFPQMPISplitMode split_mode,
+        int num_threads,
+        IVFPQLocalMPIProfile* profile = nullptr
+    ) const {
+        if (num_threads <= 1) {
+            return search_mpi_local(
+                query,
+                k,
+                nprobe,
+                rerank_p,
+                local_p,
+                rank,
+                world_size,
+                split_mode,
+                profile
+            );
+        }
+
+        std::priority_queue<std::pair<float, uint32_t> > result;
+
+        if (profile != nullptr) {
+            *profile = IVFPQLocalMPIProfile();
+        }
+
+        if (k == 0 || base_number == 0 || nlist == 0 || world_size <= 0) {
+            return result;
+        }
+
+        k = std::min(k, base_number);
+        nprobe = std::max<size_t>(1, std::min(nprobe, nlist));
+        rerank_p = std::max(k, std::min(rerank_p, base_number));
+        local_p = std::max(k, std::min(local_p, base_number));
+
+        std::vector<uint32_t> routed_ids;
+        select_probe_ids(query, nprobe, routed_ids);
+
+        std::vector<float> rotated_query;
+        const float* pq_query = prepare_pq_query(query, rotated_query);
+
+        std::vector<uint32_t> owned_ids;
+        size_t scanned_codes = 0;
+        for (uint32_t cid : routed_ids) {
+            if (ivfpq_mpi_owns_list(cid, nlist, rank, world_size, split_mode)
+                && !lists[cid].ids.empty()) {
+                owned_ids.push_back(cid);
+                scanned_codes += lists[cid].ids.size();
+            }
+        }
+
+        if (profile != nullptr) {
+            profile->owned_probe_lists = owned_ids.size();
+            profile->scanned_codes = scanned_codes;
+        }
+
+        if (owned_ids.empty()) {
+            return result;
+        }
+
+        num_threads = std::min<int>(num_threads, static_cast<int>(owned_ids.size()));
+        const size_t thread_capacity = local_p;
+        std::vector<float> thread_scores(static_cast<size_t>(num_threads) * thread_capacity);
+        std::vector<uint32_t> thread_ids(static_cast<size_t>(num_threads) * thread_capacity);
+        std::vector<size_t> thread_counts(static_cast<size_t>(num_threads), 0);
+
+        omp_set_dynamic(0);
+        #pragma omp parallel num_threads(num_threads)
+        {
+            const int tid = omp_get_thread_num();
+            float* scores = thread_scores.data() + static_cast<size_t>(tid) * thread_capacity;
+            uint32_t* ids = thread_ids.data() + static_cast<size_t>(tid) * thread_capacity;
+            size_t count = 0;
+            size_t worst_position = 0;
+            float worst_score = 0.0f;
+            std::vector<float> lut(M * Ks);
+
+            #pragma omp for schedule(dynamic, 1)
+            for (long long pos = 0; pos < static_cast<long long>(owned_ids.size()); ++pos) {
+                const LocalPQList& list = lists[owned_ids[static_cast<size_t>(pos)]];
+                build_local_pq_lut(pq_query, list, lut.data());
+
+                for (size_t j = 0; j < list.ids.size(); ++j) {
+                    const float score = scan_local_pq_code(
+                        list.codes.data() + j * M,
+                        lut.data()
+                    );
+                    ivfpqlocal_update_top_score(
+                        score,
+                        list.ids[j],
+                        scores,
+                        ids,
+                        thread_capacity,
+                        count,
+                        worst_position,
+                        worst_score
+                    );
+                }
+            }
+
+            thread_counts[static_cast<size_t>(tid)] = count;
+        }
+
+        std::vector<float> candidate_scores(rerank_p);
+        std::vector<uint32_t> candidate_ids(rerank_p);
+        size_t candidate_count = 0;
+        size_t candidate_worst_position = 0;
+        float candidate_worst_score = 0.0f;
+
+        for (int tid = 0; tid < num_threads; ++tid) {
+            const float* scores = thread_scores.data() + static_cast<size_t>(tid) * thread_capacity;
+            const uint32_t* ids = thread_ids.data() + static_cast<size_t>(tid) * thread_capacity;
+            for (size_t j = 0; j < thread_counts[static_cast<size_t>(tid)]; ++j) {
+                ivfpqlocal_update_top_score(
+                    scores[j],
+                    ids[j],
+                    candidate_scores.data(),
+                    candidate_ids.data(),
+                    rerank_p,
+                    candidate_count,
+                    candidate_worst_position,
+                    candidate_worst_score
+                );
+            }
+        }
+
+        std::vector<float> best_scores(local_p);
+        std::vector<uint32_t> best_ids(local_p);
+        size_t best_count = 0;
+        size_t best_worst_position = 0;
+        float best_worst_score = 0.0f;
+
+        for (size_t i = 0; i < candidate_count; ++i) {
+            const uint32_t id = candidate_ids[i];
+            const float score = ivfpqlocal_inner_product_neon_fma(
+                base_float + static_cast<size_t>(id) * vecdim,
+                query,
+                vecdim
+            );
+            ivfpqlocal_update_top_score(
+                score,
+                id,
+                best_scores.data(),
+                best_ids.data(),
+                local_p,
+                best_count,
+                best_worst_position,
+                best_worst_score
+            );
+        }
+
+        for (size_t i = 0; i < best_count; ++i) {
+            result.push({1.0f - best_scores[i], best_ids[i]});
+        }
+
+        if (profile != nullptr) {
+            profile->returned_candidates = best_count;
+        }
+
+        return result;
+    }
+
     std::priority_queue<std::pair<float, uint32_t> > search_omp_list_parallel(
         float* query,
         size_t k,
@@ -466,6 +811,9 @@ public:
             return result;
         }
 
+        std::vector<float> rotated_query;
+        const float* pq_query = prepare_pq_query(query, rotated_query);
+
         // 2. 为每个线程准备 local Top-p
         std::vector<float> local_scores(
             static_cast<size_t>(num_threads) * local_p
@@ -515,7 +863,7 @@ public:
                 // 每个 list 有自己的局部 PQ codebook，
                 // 因此处理每个 list 前都要构建该 list 的局部 LUT
                 build_local_pq_lut(
-                    query,
+                    pq_query,
                     list,
                     lut.data()
                 );
@@ -717,6 +1065,17 @@ public:
         return lists[cid].ids.size();
     }
 
+    bool uses_opq() const {
+        return opq_iters > 0;
+    }
+
+    double get_opq_orthogonality_error() const {
+        if (opq_rotation.empty()) {
+            return 0.0;
+        }
+        return ann_opq::orthogonality_error(opq_rotation, vecdim);
+    }
+
 private:
     float* base_float;
     size_t base_number;
@@ -731,9 +1090,12 @@ private:
     size_t kmeans_iters;
 
     IVFPQLocalInitMode init_mode;
+    size_t opq_iters;
 
     std::vector<float> coarse_centroids;
     std::vector<LocalPQList> lists;
+    std::vector<float> opq_rotation;
+    std::vector<float> rotated_base;
 
     void normalize_params() {
         if (base_number == 0 || vecdim == 0) {
@@ -798,6 +1160,11 @@ private:
         train_coarse_centroids();
         build_invlists();
 
+        if (opq_iters > 0) {
+            train_opq_rotation();
+            rotate_base_vectors();
+        }
+
         train_local_pq_for_all_lists();
         encode_all_lists();
 
@@ -808,6 +1175,30 @@ private:
 
     const float* get_base_vec(size_t id) const {
         return base_float + id * vecdim;
+    }
+
+    const float* get_pq_vec(size_t id) const {
+        if (rotated_base.empty()) {
+            return get_base_vec(id);
+        }
+        return rotated_base.data() + id * vecdim;
+    }
+
+    const float* prepare_pq_query(
+        const float* query,
+        std::vector<float>& storage
+    ) const {
+        if (opq_rotation.empty()) {
+            return query;
+        }
+        storage.resize(vecdim);
+        ann_opq::rotate_vector(
+            query,
+            opq_rotation,
+            vecdim,
+            storage.data()
+        );
+        return storage.data();
     }
 
     float* get_coarse_centroid(size_t c) {
@@ -846,6 +1237,53 @@ private:
         }
 
         return id;
+    }
+
+    void train_opq_rotation() {
+        std::cerr << "Training global OPQ rotation on IVF residuals...\n";
+        std::vector<float> residuals(train_size * vecdim);
+        for (size_t t = 0; t < train_size; ++t) {
+            const size_t id = train_id(t);
+            const float* vector = get_base_vec(id);
+            const size_t list_id = nearest_coarse_centroid(vector);
+            const float* centroid = get_coarse_centroid(list_id);
+            float* residual = residuals.data() + t * vecdim;
+            for (size_t d = 0; d < vecdim; ++d) {
+                residual[d] = vector[d] - centroid[d];
+            }
+        }
+
+        opq_rotation = ann_opq::train_rotation(
+            residuals,
+            train_size,
+            vecdim,
+            M,
+            Ks,
+            opq_iters,
+            kmeans_iters
+        );
+        const double error = ann_opq::orthogonality_error(
+            opq_rotation,
+            vecdim
+        );
+        if (error > 1e-3) {
+            throw std::runtime_error(
+                "OPQ training produced a non-orthogonal rotation."
+            );
+        }
+    }
+
+    void rotate_base_vectors() {
+        std::cerr << "Rotating base vectors for local PQ training...\n";
+        rotated_base.resize(base_number * vecdim);
+        for (size_t id = 0; id < base_number; ++id) {
+            ann_opq::rotate_vector(
+                get_base_vec(id),
+                opq_rotation,
+                vecdim,
+                rotated_base.data() + id * vecdim
+            );
+        }
     }
 
     // ========================================================
@@ -1020,7 +1458,7 @@ private:
             uint32_t id = list.ids[pos];
 
             const float* src =
-                get_base_vec(id) + m * subdim;
+                get_pq_vec(id) + m * subdim;
 
             float* dst =
                 get_local_pq_centroid(list, m, c);
@@ -1043,7 +1481,7 @@ private:
                 uint32_t id = list.ids[j];
 
                 const float* subvec =
-                    get_base_vec(id) + m * subdim;
+                    get_pq_vec(id) + m * subdim;
 
                 size_t cid = nearest_local_pq_centroid(
                     list,
@@ -1070,7 +1508,7 @@ private:
                         list.ids[(c + iter + 1) % list_size];
 
                     const float* src =
-                        get_base_vec(id) + m * subdim;
+                        get_pq_vec(id) + m * subdim;
 
                     std::copy(
                         src,
@@ -1131,7 +1569,7 @@ private:
             for (size_t j = 0; j < list.ids.size(); ++j) {
                 uint32_t id = list.ids[j];
 
-                const float* vec = get_base_vec(id);
+                const float* vec = get_pq_vec(id);
                 uint8_t* code = list.codes.data() + j * M;
 
                 for (size_t m = 0; m < M; ++m) {

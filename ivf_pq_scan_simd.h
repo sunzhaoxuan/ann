@@ -1,6 +1,7 @@
 #pragma once
 
-#include <arm_neon.h>
+#include "simd_compat.h"
+#include "opq_transform.h"
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +14,10 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+
+#if defined(__AVX2__) || defined(_M_AVX2)
+#include <immintrin.h>
+#endif
 
 // ============================================================
 // IVF-PQ-SIMD baseline
@@ -46,6 +51,25 @@ static inline float ivfpq_l2_neon(
     const float* __restrict__ b,
     size_t dim
 ) {
+#if defined(__AVX2__) || defined(_M_AVX2)
+    size_t i = 0;
+    __m256 sum = _mm256_setzero_ps();
+    for (; i + 8 <= dim; i += 8) {
+        const __m256 va = _mm256_loadu_ps(a + i);
+        const __m256 vb = _mm256_loadu_ps(b + i);
+        const __m256 diff = _mm256_sub_ps(va, vb);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(diff, diff));
+    }
+    alignas(32) float lanes[8];
+    _mm256_store_ps(lanes, sum);
+    float result = lanes[0] + lanes[1] + lanes[2] + lanes[3]
+                 + lanes[4] + lanes[5] + lanes[6] + lanes[7];
+    for (; i < dim; ++i) {
+        const float diff = a[i] - b[i];
+        result += diff * diff;
+    }
+    return result;
+#else
     size_t i = 0;
     float32x4_t sum = vdupq_n_f32(0.0f);
 
@@ -64,6 +88,7 @@ static inline float ivfpq_l2_neon(
     }
 
     return result;
+#endif
 }
 
 // ------------------------------------------------------------
@@ -74,6 +99,23 @@ static inline float ivfpq_inner_product_neon_fma(
     const float* __restrict__ b,
     size_t dim
 ) {
+#if defined(__AVX2__) || defined(_M_AVX2)
+    size_t i = 0;
+    __m256 sum = _mm256_setzero_ps();
+    for (; i + 8 <= dim; i += 8) {
+        const __m256 va = _mm256_loadu_ps(a + i);
+        const __m256 vb = _mm256_loadu_ps(b + i);
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(va, vb));
+    }
+    alignas(32) float lanes[8];
+    _mm256_store_ps(lanes, sum);
+    float result = lanes[0] + lanes[1] + lanes[2] + lanes[3]
+                 + lanes[4] + lanes[5] + lanes[6] + lanes[7];
+    for (; i < dim; ++i) {
+        result += a[i] * b[i];
+    }
+    return result;
+#else
     size_t i = 0;
     float32x4_t sum = vdupq_n_f32(0.0f);
 
@@ -90,6 +132,7 @@ static inline float ivfpq_inner_product_neon_fma(
     }
 
     return result;
+#endif
 }
 
 // ------------------------------------------------------------
@@ -233,7 +276,8 @@ public:
         size_t Ks = 256,
         size_t train_size = 10000,
         size_t kmeans_iters = 6,
-        IVFPQInitMode init_mode = IVFPQInitMode::Uniform
+        IVFPQInitMode init_mode = IVFPQInitMode::Uniform,
+        size_t opq_iters = 0
     )
         : base_float(base),
           base_number(base_number),
@@ -243,7 +287,8 @@ public:
           Ks(Ks),
           train_size(train_size),
           kmeans_iters(kmeans_iters),
-          init_mode(init_mode)
+          init_mode(init_mode),
+          opq_iters(opq_iters)
     {
         normalize_params();
 
@@ -289,6 +334,9 @@ public:
             return result;
         }
 
+        std::vector<float> rotated_query;
+        const float* pq_query = prepare_pq_query(query, rotated_query);
+
         // ----------------------------------------------------
         // 2. 构建全局 PQ LUT
         // LUT[m][c] = query_m · codebook[m][c]
@@ -296,7 +344,7 @@ public:
         std::vector<float> lut(M * Ks);
 
         build_pq_lut(
-            query,
+            pq_query,
             lut.data()
         );
 
@@ -396,6 +444,46 @@ public:
         return result;
     }
 
+    // Return approximate OPQ-IVF-PQ candidates without exact reranking.
+    // This is the hand-off point for CPU/GPU heterogeneous execution.
+    std::vector<uint32_t> generate_candidates(
+        float* query,
+        size_t nprobe,
+        size_t rerank_p
+    ) const {
+        if (base_number == 0 || nlist == 0 || rerank_p == 0) {
+            return std::vector<uint32_t>();
+        }
+        nprobe = std::max(static_cast<size_t>(1), std::min(nprobe, nlist));
+        rerank_p = std::min(rerank_p, base_number);
+        std::vector<uint32_t> probe_ids;
+        select_probe_ids(query, nprobe, probe_ids);
+        std::vector<float> rotated_query;
+        const float* pq_query = prepare_pq_query(query, rotated_query);
+        std::vector<float> lut(M * Ks);
+        build_pq_lut(pq_query, lut.data());
+        std::vector<float> scores(rerank_p);
+        std::vector<uint32_t> ids(rerank_p);
+        size_t count = 0, worst_pos = 0;
+        float worst_score = 0.0f;
+        for (size_t pp = 0; pp < probe_ids.size(); ++pp) {
+            const std::vector<uint32_t>& list = invlists[probe_ids[pp]];
+            for (size_t j = 0; j < list.size(); ++j) {
+                const uint32_t id = list[j];
+                const float score = scan_pq_code(
+                    codes.data() + static_cast<size_t>(id) * M,
+                    lut.data()
+                );
+                ivfpq_update_top_score(
+                    score, id, scores.data(), ids.data(), rerank_p,
+                    count, worst_pos, worst_score
+                );
+            }
+        }
+        ids.resize(count);
+        return ids;
+    }
+
     size_t get_nlist() const {
         return nlist;
     }
@@ -420,6 +508,17 @@ public:
         return invlists[cid].size();
     }
 
+    bool uses_opq() const {
+        return opq_iters > 0;
+    }
+
+    double get_opq_orthogonality_error() const {
+        if (opq_rotation.empty()) {
+            return 0.0;
+        }
+        return ann_opq::orthogonality_error(opq_rotation, vecdim);
+    }
+
 private:
     float* base_float;
     size_t base_number;
@@ -434,6 +533,7 @@ private:
     size_t kmeans_iters;
 
     IVFPQInitMode init_mode;
+    size_t opq_iters;
 
     // IVF
     std::vector<float> coarse_centroids;
@@ -442,6 +542,8 @@ private:
     // 全局 PQ
     std::vector<float> pq_codebooks;
     std::vector<uint8_t> codes;
+    std::vector<float> opq_rotation;
+    std::vector<float> rotated_base;
 
     void normalize_params() {
         if (base_number == 0 || vecdim == 0) {
@@ -505,6 +607,11 @@ private:
                   << ", iters = " << kmeans_iters
                   << "\n";
 
+        if (opq_iters > 0) {
+            train_opq_rotation();
+            rotate_base_vectors();
+        }
+
         train_global_pq();
         encode_all_base();
 
@@ -518,6 +625,30 @@ private:
 
     const float* get_base_vec(size_t id) const {
         return base_float + id * vecdim;
+    }
+
+    const float* get_pq_vec(size_t id) const {
+        if (rotated_base.empty()) {
+            return get_base_vec(id);
+        }
+        return rotated_base.data() + id * vecdim;
+    }
+
+    const float* prepare_pq_query(
+        const float* query,
+        std::vector<float>& storage
+    ) const {
+        if (opq_rotation.empty()) {
+            return query;
+        }
+        storage.resize(vecdim);
+        ann_opq::rotate_vector(
+            query,
+            opq_rotation,
+            vecdim,
+            storage.data()
+        );
+        return storage.data();
     }
 
     float* get_coarse_centroid(size_t c) {
@@ -550,6 +681,51 @@ private:
         return id;
     }
 
+    void train_opq_rotation() {
+        std::cerr << "Training global OPQ rotation on original vectors...\n";
+        std::vector<float> training_vectors(train_size * vecdim);
+        for (size_t t = 0; t < train_size; ++t) {
+            const size_t id = train_id(t);
+            std::copy(
+                get_base_vec(id),
+                get_base_vec(id) + vecdim,
+                training_vectors.data() + t * vecdim
+            );
+        }
+
+        opq_rotation = ann_opq::train_rotation(
+            training_vectors,
+            train_size,
+            vecdim,
+            M,
+            Ks,
+            opq_iters,
+            kmeans_iters
+        );
+        const double error = ann_opq::orthogonality_error(
+            opq_rotation,
+            vecdim
+        );
+        if (error > 1e-3) {
+            throw std::runtime_error(
+                "OPQ training produced a non-orthogonal rotation."
+            );
+        }
+    }
+
+    void rotate_base_vectors() {
+        std::cerr << "Rotating base vectors for global PQ training...\n";
+        rotated_base.resize(base_number * vecdim);
+        for (size_t id = 0; id < base_number; ++id) {
+            ann_opq::rotate_vector(
+                get_base_vec(id),
+                opq_rotation,
+                vecdim,
+                rotated_base.data() + id * vecdim
+            );
+        }
+    }
+
     // ========================================================
     // 全局 PQ 训练
     // ========================================================
@@ -573,7 +749,7 @@ private:
             size_t id = train_id(t);
 
             const float* src =
-                get_base_vec(id) + m * subdim;
+                get_pq_vec(id) + m * subdim;
 
             float* dst = get_pq_centroid(m, c);
 
@@ -595,7 +771,7 @@ private:
                 size_t id = train_id(t);
 
                 const float* subvec =
-                    get_base_vec(id) + m * subdim;
+                    get_pq_vec(id) + m * subdim;
 
                 size_t cid = nearest_pq_centroid(
                     subvec,
@@ -619,7 +795,7 @@ private:
                     size_t id = train_id((c + iter + 1) % train_size);
 
                     const float* src =
-                        get_base_vec(id) + m * subdim;
+                        get_pq_vec(id) + m * subdim;
 
                     std::copy(
                         src,
@@ -668,7 +844,7 @@ private:
         std::cerr << "Encoding base vectors by global PQ...\n";
 
         for (size_t i = 0; i < base_number; ++i) {
-            const float* vec = get_base_vec(i);
+            const float* vec = get_pq_vec(i);
             uint8_t* code = codes.data() + i * M;
 
             for (size_t m = 0; m < M; ++m) {

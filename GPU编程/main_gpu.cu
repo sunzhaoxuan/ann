@@ -139,9 +139,12 @@ float compute_recall_at_k(
     return static_cast<float>(acc) / static_cast<float>(k);
 }
 
-int main() {
+int main(int argc, char** argv) {
     // 本机建议使用相对路径，把数据集放在 ./data/ 下
-    std::string data_path = "./data/";
+    std::string data_path = argc > 1 ? argv[1] : "./data/";
+    if (!data_path.empty() && data_path.back() != '/' && data_path.back() != '\\') {
+        data_path.push_back('/');
+    }
 
     size_t test_number = 0;
     size_t base_number = 0;

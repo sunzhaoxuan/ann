@@ -9,7 +9,7 @@
 #include <limits>
 #include <iostream>
 #include <random>
-#include <arm_neon.h>
+#include "simd_compat.h"
 #include <pthread.h>
 #include <omp.h>
 #include <utility>

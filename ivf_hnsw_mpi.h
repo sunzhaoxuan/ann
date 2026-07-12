@@ -14,7 +14,7 @@
 #include <set>
 #include <utility>
 #include <vector>
-#include <arm_neon.h>
+#include "simd_compat.h"
 
 #include "hnswlib/hnswlib/hnswlib.h"
 

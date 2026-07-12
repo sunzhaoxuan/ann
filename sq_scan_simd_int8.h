@@ -6,7 +6,7 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
-#include <arm_neon.h>
+#include "simd_compat.h"
 
 #include "flat_scan_simd.h"
 

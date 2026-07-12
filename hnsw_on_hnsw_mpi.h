@@ -11,6 +11,7 @@
 #include <memory>
 #include <queue>
 #include <set>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -381,6 +382,10 @@ private:
 
     size_t train_size;
     int kmeans_iters;
+    std::string local_hnsw_layout;
+    size_t gorder_window;
+    size_t reordered_moved_nodes;
+    bool local_edge_profiling;
 
     std::vector<float> partition_reps;
     std::vector<uint32_t> local_ids;
@@ -582,7 +587,9 @@ public:
         int upper_ef_construction_,
         int upper_ef_search_,
         size_t train_size_ = 10000,
-        int kmeans_iters_ = 6
+        int kmeans_iters_ = 6,
+        const std::string& local_hnsw_layout_ = "original",
+        size_t gorder_window_ = 5
     )
         : base_data(base),
           base_number(base_num),
@@ -597,16 +604,50 @@ public:
           upper_ef_search(upper_ef_search_),
           train_size(train_size_),
           kmeans_iters(kmeans_iters_),
+          local_hnsw_layout(local_hnsw_layout_),
+          gorder_window(gorder_window_),
+          reordered_moved_nodes(0),
+          local_edge_profiling(false),
           lower_space(static_cast<int>(dim)),
           upper_space(static_cast<int>(dim)) {
         train_kmeans_partitions();
         build_local_partition();
         build_upper_hnsw();
         build_local_hnsw();
+        if (local_hnsw && local_hnsw_layout == "rcm") {
+            reordered_moved_nodes = local_hnsw->reorderIndexRCM();
+        } else if (local_hnsw && local_hnsw_layout == "gorder") {
+            reordered_moved_nodes = local_hnsw->reorderIndexGorder(gorder_window);
+        }
     }
 
     size_t local_size() const {
         return local_ids.size();
+    }
+
+    size_t reordered_moved_count() const {
+        return reordered_moved_nodes;
+    }
+
+    void start_local_edge_profiling() {
+        if (local_hnsw) {
+            local_hnsw->startEdgeProfiling();
+            local_edge_profiling = true;
+        }
+    }
+
+    uint64_t local_profiled_edge_traversals() const {
+        return local_hnsw
+            ? local_hnsw->getProfiledEdgeTraversals()
+            : 0;
+    }
+
+    size_t finish_local_porder(size_t window) {
+        local_edge_profiling = false;
+        reordered_moved_nodes = local_hnsw
+            ? local_hnsw->reorderIndexPorder(window)
+            : 0;
+        return reordered_moved_nodes;
     }
 
     void set_lower_ef_search(int ef) {
@@ -721,10 +762,9 @@ public:
             return local_topk;
         }
 
-        auto sub_res = local_hnsw->searchKnn(
-            query,
-            search_k
-        );
+        auto sub_res = local_edge_profiling
+            ? local_hnsw->searchKnnProfiled(query, search_k)
+            : local_hnsw->searchKnn(query, search_k);
 
         while (!sub_res.empty()) {
             float dist = sub_res.top().first;

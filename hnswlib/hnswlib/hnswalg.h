@@ -9,6 +9,10 @@
 #include <unordered_set>
 #include <list>
 #include <memory>
+#include <algorithm>
+#include <queue>
+#include <cstdint>
+#include <set>
 
 namespace hnswlib {
 typedef unsigned int tableint;
@@ -64,6 +68,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     mutable std::atomic<long> metric_distance_computations{0};
     mutable std::atomic<long> metric_hops{0};
+
+    // Offline Porder profiling state. Profiling is intentionally single-threaded;
+    // measured searches run with this flag disabled and pay only one predictable
+    // branch in the level-0 neighbor loop.
+    mutable bool edge_profile_enabled_{false};
+    mutable std::vector<std::vector<uint64_t> > edge_profile_counts_;
 
     bool allow_replace_deleted_ = false;  // flag to replace deleted elements (marked as deleted) during insertions
 
@@ -149,6 +159,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
     void clear() {
+        edge_profile_enabled_ = false;
+        std::vector<std::vector<uint64_t> >().swap(edge_profile_counts_);
         free(data_level0_memory_);
         data_level0_memory_ = nullptr;
         for (tableint i = 0; i < cur_element_count; i++) {
@@ -172,6 +184,594 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
     void setEf(size_t ef) {
         ef_ = ef;
+    }
+
+
+ private:
+    void buildLevel0GraphUnlocked(
+        std::vector<std::vector<tableint> >& out_neighbors,
+        std::vector<std::vector<tableint> >& in_neighbors,
+        const char* layout_name) const {
+        const size_t count = cur_element_count.load();
+        out_neighbors.assign(count, std::vector<tableint>());
+        in_neighbors.assign(count, std::vector<tableint>());
+        for (tableint node = 0; node < count; ++node) {
+            linklistsizeint* links = get_linklist0(node);
+            const size_t degree = getListCount(links);
+            tableint* neighbors = reinterpret_cast<tableint*>(links + 1);
+            for (size_t i = 0; i < degree; ++i) {
+                const tableint neighbor = neighbors[i];
+                if (neighbor >= count) {
+                    throw std::runtime_error(
+                        std::string(layout_name) + " found an invalid level-0 neighbor id");
+                }
+                if (neighbor == node) {
+                    continue;
+                }
+                out_neighbors[node].push_back(neighbor);
+            }
+        }
+        for (size_t node = 0; node < count; ++node) {
+            std::vector<tableint>& neighbors = out_neighbors[node];
+            std::sort(neighbors.begin(), neighbors.end());
+            neighbors.erase(std::unique(neighbors.begin(), neighbors.end()), neighbors.end());
+            for (tableint neighbor : neighbors) {
+                in_neighbors[neighbor].push_back(static_cast<tableint>(node));
+            }
+        }
+    }
+
+
+    size_t applyNodeOrderUnlocked(
+        const std::vector<tableint>& new_to_old,
+        const char* layout_name) {
+        const size_t count = cur_element_count.load();
+        if (count < 2) {
+            return 0;
+        }
+        if (new_to_old.size() != count) {
+            throw std::runtime_error(
+                std::string(layout_name) + " produced an order with the wrong size");
+        }
+        if (enterpoint_node_ >= count) {
+            throw std::runtime_error(
+                std::string(layout_name) + " found an invalid HNSW entry point");
+        }
+
+        std::vector<tableint> old_to_new(count);
+        std::vector<unsigned char> seen(count, 0);
+        size_t moved = 0;
+        for (tableint new_id = 0; new_id < count; ++new_id) {
+            const tableint old_id = new_to_old[new_id];
+            if (old_id >= count || seen[old_id]) {
+                throw std::runtime_error(
+                    std::string(layout_name) + " produced an invalid node permutation");
+            }
+            seen[old_id] = 1;
+            old_to_new[old_id] = new_id;
+            moved += old_id != new_id;
+        }
+        if (moved == 0) {
+            return 0;
+        }
+
+        edge_profile_enabled_ = false;
+        std::vector<std::vector<uint64_t> >().swap(edge_profile_counts_);
+
+        // Validate all neighbor ids before allocating or mutating storage.
+        for (tableint node = 0; node < count; ++node) {
+            for (int level = 0; level <= element_levels_[node]; ++level) {
+                linklistsizeint* links = get_linklist_at_level(node, level);
+                const size_t degree = getListCount(links);
+                tableint* neighbors = reinterpret_cast<tableint*>(links + 1);
+                for (size_t i = 0; i < degree; ++i) {
+                    if (neighbors[i] >= count) {
+                        throw std::runtime_error(
+                            std::string(layout_name) + " found an invalid neighbor id");
+                    }
+                }
+            }
+        }
+
+        std::vector<int> reordered_levels(max_elements_, 0);
+        char* reordered_data = static_cast<char*>(
+            malloc(max_elements_ * size_data_per_element_));
+        char** reordered_links = static_cast<char**>(
+            calloc(max_elements_, sizeof(char*)));
+        if (reordered_data == nullptr || reordered_links == nullptr) {
+            free(reordered_data);
+            free(reordered_links);
+            throw std::runtime_error("Not enough memory to reorder HNSW index");
+        }
+
+        try {
+            for (tableint new_id = 0; new_id < count; ++new_id) {
+                const tableint old_id = new_to_old[new_id];
+                memcpy(
+                    reordered_data + new_id * size_data_per_element_,
+                    data_level0_memory_ + old_id * size_data_per_element_,
+                    size_data_per_element_);
+                reordered_levels[new_id] = element_levels_[old_id];
+
+                const int levels = element_levels_[old_id];
+                if (levels > 0) {
+                    const size_t bytes = size_links_per_element_ * static_cast<size_t>(levels);
+                    reordered_links[new_id] = static_cast<char*>(malloc(bytes + 1));
+                    if (reordered_links[new_id] == nullptr) {
+                        throw std::runtime_error("Not enough memory to reorder HNSW upper layers");
+                    }
+                    memcpy(reordered_links[new_id], linkLists_[old_id], bytes);
+                    reordered_links[new_id][bytes] = 0;
+                }
+            }
+        } catch (...) {
+            for (tableint node = 0; node < count; ++node) {
+                free(reordered_links[node]);
+            }
+            free(reordered_links);
+            free(reordered_data);
+            throw;
+        }
+
+        // Rewrite internal ids in the copied level-0 and upper-layer lists.
+        for (tableint new_id = 0; new_id < count; ++new_id) {
+            linklistsizeint* level0 = reinterpret_cast<linklistsizeint*>(
+                reordered_data + new_id * size_data_per_element_ + offsetLevel0_);
+            const size_t level0_degree = getListCount(level0);
+            tableint* level0_neighbors = reinterpret_cast<tableint*>(level0 + 1);
+            for (size_t i = 0; i < level0_degree; ++i) {
+                level0_neighbors[i] = old_to_new[level0_neighbors[i]];
+            }
+
+            for (int level = 1; level <= reordered_levels[new_id]; ++level) {
+                linklistsizeint* links = reinterpret_cast<linklistsizeint*>(
+                    reordered_links[new_id]
+                    + (level - 1) * size_links_per_element_);
+                const size_t degree = getListCount(links);
+                tableint* neighbors = reinterpret_cast<tableint*>(links + 1);
+                for (size_t i = 0; i < degree; ++i) {
+                    neighbors[i] = old_to_new[neighbors[i]];
+                }
+            }
+        }
+
+        std::unordered_map<labeltype, tableint> reordered_lookup;
+        std::unordered_set<tableint> reordered_deleted;
+        try {
+            reordered_lookup.reserve(label_lookup_.size());
+            for (tableint new_id = 0; new_id < count; ++new_id) {
+                labeltype label;
+                memcpy(
+                    &label,
+                    reordered_data + new_id * size_data_per_element_ + label_offset_,
+                    sizeof(labeltype));
+                reordered_lookup[label] = new_id;
+            }
+
+            reordered_deleted.reserve(deleted_elements.size());
+            for (tableint old_id : deleted_elements) {
+                if (old_id >= count) {
+                    throw std::runtime_error(
+                        std::string(layout_name) + " found an invalid deleted-element id");
+                }
+                reordered_deleted.insert(old_to_new[old_id]);
+            }
+        } catch (...) {
+            for (tableint node = 0; node < count; ++node) {
+                free(reordered_links[node]);
+            }
+            free(reordered_links);
+            free(reordered_data);
+            throw;
+        }
+
+        char* old_data = data_level0_memory_;
+        char** old_links = linkLists_;
+
+        data_level0_memory_ = reordered_data;
+        linkLists_ = reordered_links;
+        element_levels_.swap(reordered_levels);
+        enterpoint_node_ = old_to_new[enterpoint_node_];
+        label_lookup_.swap(reordered_lookup);
+        deleted_elements.swap(reordered_deleted);
+
+        for (tableint old_id = 0; old_id < count; ++old_id) {
+            if (reordered_levels[old_id] > 0) {
+                free(old_links[old_id]);
+            }
+        }
+        free(old_links);
+        free(old_data);
+
+        return moved;
+    }
+
+
+ public:
+    // Reorder a fully-built, static index with Reverse Cuthill-McKee (RCM).
+    // The graph topology, neighbor-list order, vectors, and external labels are
+    // preserved. Call after construction and before any concurrent access.
+    size_t reorderIndexRCM() {
+        std::unique_lock<std::mutex> global_lock(global);
+        std::unique_lock<std::mutex> lookup_lock(label_lookup_lock);
+
+        const size_t count = cur_element_count.load();
+        if (count < 2) {
+            return 0;
+        }
+
+        std::vector<std::vector<tableint> > out_neighbors;
+        std::vector<std::vector<tableint> > in_neighbors;
+        buildLevel0GraphUnlocked(out_neighbors, in_neighbors, "RCM");
+
+        // RCM is defined on an undirected graph. HNSW links are usually
+        // bidirectional, but joining outgoing and incoming links also handles
+        // edges made asymmetric by pruning.
+        std::vector<std::vector<tableint> > adjacency(count);
+        for (tableint node = 0; node < count; ++node) {
+            adjacency[node] = out_neighbors[node];
+            adjacency[node].insert(
+                adjacency[node].end(),
+                in_neighbors[node].begin(), in_neighbors[node].end());
+            std::sort(adjacency[node].begin(), adjacency[node].end());
+            adjacency[node].erase(
+                std::unique(adjacency[node].begin(), adjacency[node].end()),
+                adjacency[node].end());
+        }
+
+        // Cuthill-McKee visits a minimum-degree seed in every component and
+        // enqueues each frontier by increasing degree. RCM reverses that order.
+        std::vector<unsigned char> visited(count, 0);
+        std::vector<tableint> cuthill_mckee;
+        cuthill_mckee.reserve(count);
+        std::queue<tableint> frontier;
+        std::vector<tableint> seed_order(count);
+        for (tableint node = 0; node < count; ++node) {
+            seed_order[node] = node;
+        }
+        std::sort(seed_order.begin(), seed_order.end(),
+            [&](tableint lhs, tableint rhs) {
+                if (adjacency[lhs].size() != adjacency[rhs].size()) {
+                    return adjacency[lhs].size() < adjacency[rhs].size();
+                }
+                return lhs < rhs;
+            });
+        size_t seed_cursor = 0;
+
+        while (cuthill_mckee.size() < count) {
+            while (seed_cursor < count && visited[seed_order[seed_cursor]]) {
+                ++seed_cursor;
+            }
+            if (seed_cursor >= count) {
+                throw std::runtime_error("RCM failed to select a component seed");
+            }
+            const tableint seed = seed_order[seed_cursor++];
+
+            visited[seed] = 1;
+            frontier.push(seed);
+            while (!frontier.empty()) {
+                const tableint node = frontier.front();
+                frontier.pop();
+                cuthill_mckee.push_back(node);
+
+                std::vector<tableint> next;
+                for (tableint neighbor : adjacency[node]) {
+                    if (!visited[neighbor]) {
+                        visited[neighbor] = 1;
+                        next.push_back(neighbor);
+                    }
+                }
+                std::sort(next.begin(), next.end(),
+                    [&](tableint lhs, tableint rhs) {
+                        if (adjacency[lhs].size() != adjacency[rhs].size()) {
+                            return adjacency[lhs].size() < adjacency[rhs].size();
+                        }
+                        return lhs < rhs;
+                    });
+                for (tableint neighbor : next) {
+                    frontier.push(neighbor);
+                }
+            }
+        }
+
+        std::reverse(cuthill_mckee.begin(), cuthill_mckee.end());
+        return applyNodeOrderUnlocked(cuthill_mckee, "RCM");
+    }
+
+
+    // Greedily maximize the Gorder sliding-window objective
+    // S(u,v) = directed edges between u/v + shared in-neighbors.
+    // The default window of five follows the original Gorder experiments.
+    size_t reorderIndexGorder(size_t window = 5) {
+        std::unique_lock<std::mutex> global_lock(global);
+        std::unique_lock<std::mutex> lookup_lock(label_lookup_lock);
+
+        const size_t count = cur_element_count.load();
+        if (count < 2) {
+            return 0;
+        }
+        if (window == 0) {
+            throw std::runtime_error("Gorder window must be positive");
+        }
+
+        std::vector<std::vector<tableint> > out_neighbors;
+        std::vector<std::vector<tableint> > in_neighbors;
+        buildLevel0GraphUnlocked(out_neighbors, in_neighbors, "Gorder");
+
+        struct Candidate {
+            int64_t score;
+            size_t degree;
+            tableint node;
+        };
+        struct CandidateLess {
+            bool operator()(const Candidate& lhs, const Candidate& rhs) const {
+                if (lhs.score != rhs.score) {
+                    return lhs.score > rhs.score;
+                }
+                if (lhs.degree != rhs.degree) {
+                    return lhs.degree > rhs.degree;
+                }
+                return lhs.node < rhs.node;
+            }
+        };
+
+        std::vector<int64_t> scores(count, 0);
+        std::vector<unsigned char> placed(count, 0);
+        std::vector<size_t> reuse_degree(count, 0);
+        std::set<Candidate, CandidateLess> candidates;
+        for (tableint node = 0; node < count; ++node) {
+            reuse_degree[node] =
+                out_neighbors[node].size() + in_neighbors[node].size();
+            candidates.insert(Candidate{0, reuse_degree[node], node});
+        }
+
+        std::vector<tableint> order;
+        order.reserve(count);
+        std::vector<int64_t> delta(count, 0);
+        std::vector<tableint> touched;
+        touched.reserve(maxM0_ * maxM0_ + 2 * maxM0_);
+
+        const auto add_delta = [&](tableint node, int64_t value) {
+            if (placed[node]) {
+                return;
+            }
+            if (delta[node] == 0) {
+                touched.push_back(node);
+            }
+            delta[node] += value;
+        };
+
+        const auto accumulate_pair_scores = [&](tableint anchor, int64_t sign) {
+            // Direct connections in either direction. Bidirectional HNSW links
+            // correctly contribute two to the Gorder score.
+            for (tableint neighbor : out_neighbors[anchor]) {
+                add_delta(neighbor, sign);
+            }
+            for (tableint neighbor : in_neighbors[anchor]) {
+                add_delta(neighbor, sign);
+            }
+
+            // Every shared parent contributes one common in-neighbor.
+            for (tableint parent : in_neighbors[anchor]) {
+                for (tableint sibling : out_neighbors[parent]) {
+                    if (sibling != anchor) {
+                        add_delta(sibling, sign);
+                    }
+                }
+            }
+        };
+
+        for (size_t position = 0; position < count; ++position) {
+            if (candidates.empty()) {
+                throw std::runtime_error("Gorder candidate set became empty");
+            }
+            const Candidate best = *candidates.begin();
+            candidates.erase(candidates.begin());
+
+            placed[best.node] = 1;
+            order.push_back(best.node);
+            touched.clear();
+            accumulate_pair_scores(best.node, 1);
+            if (position >= window) {
+                accumulate_pair_scores(order[position - window], -1);
+            }
+
+            for (tableint node : touched) {
+                if (!placed[node] && delta[node] != 0) {
+                    const size_t erased = candidates.erase(Candidate{
+                        scores[node], reuse_degree[node], node});
+                    if (erased != 1) {
+                        throw std::runtime_error("Gorder lost a candidate score entry");
+                    }
+                    scores[node] += delta[node];
+                    candidates.insert(Candidate{
+                        scores[node], reuse_degree[node], node});
+                }
+                delta[node] = 0;
+            }
+        }
+
+        return applyNodeOrderUnlocked(order, "Gorder");
+    }
+
+
+    void startEdgeProfiling() {
+        std::unique_lock<std::mutex> global_lock(global);
+        const size_t count = cur_element_count.load();
+        edge_profile_counts_.assign(count, std::vector<uint64_t>());
+        for (tableint node = 0; node < count; ++node) {
+            const size_t degree = getListCount(get_linklist0(node));
+            edge_profile_counts_[node].assign(degree, 0);
+        }
+        edge_profile_enabled_ = true;
+    }
+
+
+    uint64_t getProfiledEdgeTraversals() const {
+        uint64_t total = 0;
+        for (const std::vector<uint64_t>& counts : edge_profile_counts_) {
+            for (uint64_t count : counts) {
+                total += count;
+            }
+        }
+        return total;
+    }
+
+
+    // Porder is weighted Gorder. Edge e receives weight 1 + T_e, where T_e is
+    // the number of times profiling searches examined that level-0 edge.
+    size_t reorderIndexPorder(size_t window = 5) {
+        std::unique_lock<std::mutex> global_lock(global);
+        std::unique_lock<std::mutex> lookup_lock(label_lookup_lock);
+
+        const size_t count = cur_element_count.load();
+        edge_profile_enabled_ = false;
+        if (count < 2) {
+            edge_profile_counts_.clear();
+            return 0;
+        }
+        if (window == 0) {
+            throw std::runtime_error("Porder window must be positive");
+        }
+        if (edge_profile_counts_.size() != count) {
+            throw std::runtime_error("Porder requires startEdgeProfiling before reordering");
+        }
+
+        struct WeightedEdge {
+            tableint node;
+            uint64_t weight;
+        };
+        std::vector<std::vector<WeightedEdge> > out_neighbors(count);
+        std::vector<std::vector<WeightedEdge> > in_neighbors(count);
+        for (tableint node = 0; node < count; ++node) {
+            linklistsizeint* links = get_linklist0(node);
+            const size_t degree = getListCount(links);
+            if (edge_profile_counts_[node].size() != degree) {
+                throw std::runtime_error("Porder graph changed during edge profiling");
+            }
+            tableint* neighbors = reinterpret_cast<tableint*>(links + 1);
+            out_neighbors[node].reserve(degree);
+            for (size_t i = 0; i < degree; ++i) {
+                const tableint neighbor = neighbors[i];
+                if (neighbor >= count) {
+                    throw std::runtime_error("Porder found an invalid level-0 neighbor id");
+                }
+                if (neighbor == node) {
+                    continue;
+                }
+                const uint64_t weight = 1 + edge_profile_counts_[node][i];
+                out_neighbors[node].push_back(WeightedEdge{neighbor, weight});
+                in_neighbors[neighbor].push_back(WeightedEdge{node, weight});
+            }
+        }
+
+        struct Candidate {
+            int64_t score;
+            uint64_t degree;
+            tableint node;
+        };
+        struct CandidateLess {
+            bool operator()(const Candidate& lhs, const Candidate& rhs) const {
+                if (lhs.score != rhs.score) {
+                    return lhs.score > rhs.score;
+                }
+                if (lhs.degree != rhs.degree) {
+                    return lhs.degree > rhs.degree;
+                }
+                return lhs.node < rhs.node;
+            }
+        };
+
+        std::vector<int64_t> scores(count, 0);
+        std::vector<unsigned char> placed(count, 0);
+        std::vector<uint64_t> weighted_degree(count, 0);
+        std::set<Candidate, CandidateLess> candidates;
+        for (tableint node = 0; node < count; ++node) {
+            uint64_t degree = 0;
+            for (const WeightedEdge& edge : out_neighbors[node]) {
+                degree += edge.weight;
+            }
+            for (const WeightedEdge& edge : in_neighbors[node]) {
+                degree += edge.weight;
+            }
+            weighted_degree[node] = degree;
+            candidates.insert(Candidate{0, degree, node});
+        }
+
+        std::vector<tableint> order;
+        order.reserve(count);
+        std::vector<int64_t> delta(count, 0);
+        std::vector<tableint> touched;
+        touched.reserve(maxM0_ * maxM0_ + 2 * maxM0_);
+
+        const auto add_delta = [&](tableint node, int64_t value) {
+            if (placed[node]) {
+                return;
+            }
+            if (delta[node] == 0) {
+                touched.push_back(node);
+            }
+            delta[node] += value;
+        };
+
+        const auto accumulate_pair_scores = [&](tableint anchor, int64_t sign) {
+            // Scores use doubled units: a direct edge contributes 2*w_e, while
+            // a shared parent contributes w(parent,anchor)+w(parent,sibling).
+            // With unit weights this is exactly 2*Gscore, preserving Gorder.
+            for (const WeightedEdge& edge : out_neighbors[anchor]) {
+                add_delta(edge.node, sign * static_cast<int64_t>(2 * edge.weight));
+            }
+            for (const WeightedEdge& edge : in_neighbors[anchor]) {
+                add_delta(edge.node, sign * static_cast<int64_t>(2 * edge.weight));
+            }
+            for (const WeightedEdge& parent_edge : in_neighbors[anchor]) {
+                for (const WeightedEdge& sibling_edge : out_neighbors[parent_edge.node]) {
+                    if (sibling_edge.node != anchor) {
+                        const uint64_t shared_weight =
+                            parent_edge.weight + sibling_edge.weight;
+                        add_delta(
+                            sibling_edge.node,
+                            sign * static_cast<int64_t>(shared_weight));
+                    }
+                }
+            }
+        };
+
+        for (size_t position = 0; position < count; ++position) {
+            if (candidates.empty()) {
+                throw std::runtime_error("Porder candidate set became empty");
+            }
+            const Candidate best = *candidates.begin();
+            candidates.erase(candidates.begin());
+            placed[best.node] = 1;
+            order.push_back(best.node);
+
+            touched.clear();
+            accumulate_pair_scores(best.node, 1);
+            if (position >= window) {
+                accumulate_pair_scores(order[position - window], -1);
+            }
+
+            for (tableint node : touched) {
+                if (!placed[node] && delta[node] != 0) {
+                    const size_t erased = candidates.erase(Candidate{
+                        scores[node], weighted_degree[node], node});
+                    if (erased != 1) {
+                        throw std::runtime_error("Porder lost a candidate score entry");
+                    }
+                    scores[node] += delta[node];
+                    if (scores[node] < 0) {
+                        throw std::runtime_error("Porder produced a negative window score");
+                    }
+                    candidates.insert(Candidate{
+                        scores[node], weighted_degree[node], node});
+                }
+                delta[node] = 0;
+            }
+        }
+
+        std::vector<std::vector<uint64_t> >().swap(edge_profile_counts_);
+        return applyNodeOrderUnlocked(order, "Porder");
     }
 
 
@@ -306,7 +906,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     // bare_bone_search means there is no check for deletions and stop condition is ignored in return of extra performance
-    template <bool bare_bone_search = true, bool collect_metrics = false>
+    template <
+        bool bare_bone_search = true,
+        bool collect_metrics = false,
+        bool collect_edge_profile = false>
     std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst>
     searchBaseLayerST(
         tableint ep_id,
@@ -376,6 +979,14 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
             for (size_t j = 1; j <= size; j++) {
                 int candidate_id = *(data + j);
+                if (collect_edge_profile) {
+                    if (current_node_id >= edge_profile_counts_.size()
+                        || j - 1 >= edge_profile_counts_[current_node_id].size()) {
+                        visited_list_pool_->releaseVisitedList(vl);
+                        throw std::runtime_error("Porder edge profile no longer matches HNSW graph");
+                    }
+                    ++edge_profile_counts_[current_node_id][j - 1];
+                }
 //                    if (candidate_id == 0) continue;
 #ifdef USE_SSE
                 _mm_prefetch((char *) (visited_array + *(data + j + 1)), _MM_HINT_T0);
@@ -1267,8 +1878,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
+    template <bool collect_edge_profile>
     std::priority_queue<std::pair<dist_t, labeltype >>
-    searchKnn(const void *query_data, size_t k, BaseFilterFunctor* isIdAllowed = nullptr) const {
+    searchKnnInternal(
+        const void *query_data,
+        size_t k,
+        BaseFilterFunctor* isIdAllowed = nullptr) const {
         std::priority_queue<std::pair<dist_t, labeltype >> result;
         if (cur_element_count == 0) return result;
 
@@ -1305,10 +1920,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates;
         bool bare_bone_search = !num_deleted_ && !isIdAllowed;
         if (bare_bone_search) {
-            top_candidates = searchBaseLayerST<true>(
+            top_candidates = searchBaseLayerST<true, false, collect_edge_profile>(
                     currObj, query_data, std::max(ef_, k), isIdAllowed);
         } else {
-            top_candidates = searchBaseLayerST<false>(
+            top_candidates = searchBaseLayerST<false, false, collect_edge_profile>(
                     currObj, query_data, std::max(ef_, k), isIdAllowed);
         }
 
@@ -1321,6 +1936,28 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             top_candidates.pop();
         }
         return result;
+    }
+
+
+    std::priority_queue<std::pair<dist_t, labeltype >>
+    searchKnn(
+        const void *query_data,
+        size_t k,
+        BaseFilterFunctor* isIdAllowed = nullptr) const {
+        return searchKnnInternal<false>(query_data, k, isIdAllowed);
+    }
+
+
+    std::priority_queue<std::pair<dist_t, labeltype >>
+    searchKnnProfiled(
+        const void *query_data,
+        size_t k,
+        BaseFilterFunctor* isIdAllowed = nullptr) const {
+        if (!edge_profile_enabled_) {
+            throw std::runtime_error(
+                "searchKnnProfiled requires startEdgeProfiling first");
+        }
+        return searchKnnInternal<true>(query_data, k, isIdAllowed);
     }
 
 
